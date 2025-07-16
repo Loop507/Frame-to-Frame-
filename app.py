@@ -179,7 +179,7 @@ def write_video_imageio(frames, fps, output_path):
 
 # --- Streamlit App ---
 
-st.title("🎥 Video MP4 con molti effetti di transizione")
+st.title("🎥 Video MP4 con tutti gli effetti di transizione")
 
 img1_file = st.file_uploader("Carica prima immagine", type=["png","jpg","jpeg"])
 img2_file = st.file_uploader("Carica seconda immagine", type=["png","jpg","jpeg"])
@@ -194,7 +194,7 @@ effects = {
     "Zoom": zoom_transition,
     "Pixel Random": pixel_random_transition,
     "Pixel a Blocchi": pixel_block_transition,
-    "Onda": wave_transition,
+    "Onda (Wave)": wave_transition,
     "Spirale": spiral_transition,
     "Scorrimento Sinistra": lambda i1,i2,n: slide_transition(i1,i2,n,'left'),
     "Scorrimento Destra": lambda i1,i2,n: slide_transition(i1,i2,n,'right'),
