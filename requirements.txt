@@ -1,4 +1,5 @@
 streamlit
 numpy
-Pillow
-imageio[ffmpeg]
+pillow
+opencv-python-headless
+moviepy
