@@ -1,18 +1,21 @@
+# morphing_app.py
 import numpy as np
 from PIL import Image
 import streamlit as st
 import tempfile
 import os
 import math
+import cv2
+from scipy import interpolate
 from typing import List, Tuple
 
 # --- Configurazione Streamlit ---
 st.set_page_config(
-    page_title="🎞️ Advanced Morphing", 
+    page_title="🎞️ Advanced Morphing Pro", 
     layout="wide", 
     initial_sidebar_state="expanded"
 )
-st.title("🔄 Morphing Multi-Immagine")
+st.title("🔄 Morphing Multi-Immagine Pro")
 
 # --- Costanti ---
 MAX_IMAGES = 10
@@ -26,104 +29,123 @@ ASPECT_RATIOS = {
     "1:1 (Quadrato)": (1, 1),
     "9:16 (Verticale)": (9, 16),
     "16:9 (Orizzontale)": (16, 9),
+    "4:3 (Classico)": (4, 3),
+    "21:9 (Cinema)": (21, 9),
     "Personalizzato": None
 }
 
-# --- Funzioni Core ---
+# --- Funzioni Core con OpenCV e Scipy ---
 def calculate_frames(duration_sec: int, fps: int) -> int:
-    """Calcola il numero di frame in base a durata e fps."""
     return int(duration_sec * fps)
 
 def load_and_process_image(file, target_size: Tuple[int, int]) -> np.ndarray:
-    """Carica e ridimensiona un'immagine."""
     img = Image.open(file).convert("RGB")
-    img = img.resize(target_size, Image.LANCZOS)
-    return np.array(img)
+    img = np.array(img)
+    
+    # Resize con OpenCV per mantenere qualità
+    if img.shape[:2] != target_size[::-1]:
+        img = cv2.resize(img, target_size, interpolation=cv2.INTER_LANCZOS4)
+    
+    return img
 
-def grid_warp_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
-    """Morphing avanzato con deformazione di griglia."""
+def advanced_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+    """Morphing avanzato con optical flow e interpolazione spline"""
     h, w = img1.shape[:2]
+    
+    # Calcola optical flow con OpenCV
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(
+        gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    
+    # Crea griglia di coordinate
     x, y = np.meshgrid(np.arange(w), np.arange(h))
     
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
-        # Distorsione dinamica
-        distortion = 20 * math.sin(alpha * math.pi)  # Effetto a "onda"
+        # Interpolazione del flusso ottico
+        interp_flow = flow * alpha
+        xn = x + interp_flow[..., 0]
+        yn = y + interp_flow[..., 1]
         
-        dx = distortion * np.sin(y/h * 2*math.pi + alpha * 2*math.pi)
-        dy = distortion * np.cos(x/w * 2*math.pi + alpha * 2*math.pi)
-        
-        xn = np.clip(x + dx, 0, w-1)
-        yn = np.clip(y + dy, 0, h-1)
-        
-        # Interpolazione avanzata
+        # Interpolazione spline (Scipy)
         morphed = np.zeros_like(img1)
         for c in range(3):
-            morphed[..., c] = (
-                img1[..., c] * (1 - alpha) + 
-                img2[..., c] * alpha
+            spline = interpolate.RectBivariateSpline(
+                np.arange(h), np.arange(w), img1[..., c]
             )
+            morphed[..., c] = spline.ev(yn, xn)
+            
+            spline = interpolate.RectBivariateSpline(
+                np.arange(h), np.arange(w), img2[..., c]
+            )
+            morphed[..., c] = morphed[..., c] * (1 - alpha) + spline.ev(yn, xn) * alpha
         
         frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
     
     return frames
 
 def generate_transitions(images: List[np.ndarray], duration_sec: int, fps: int) -> List[np.ndarray]:
-    """Genera tutte le transizioni tra le immagini."""
     total_frames = calculate_frames(duration_sec, fps)
-    frames_per_transition = total_frames // (len(images) - 1)
+    frames_per_transition = max(10, total_frames // (len(images) - 1))
     
     all_frames = []
     for i in range(len(images) - 1):
-        transition = grid_warp_morph(images[i], images[i+1], frames_per_transition)
-        all_frames.extend(transition)
+        with st.spinner(f"Generando transizione {i+1}/{len(images)-1}..."):
+            transition = advanced_morph(images[i], images[i+1], frames_per_transition)
+            all_frames.extend(transition)
     
     return all_frames
 
-def save_video(frames: List[np.ndarray], path: str, fps: int) -> None:
-    """Salva come GIF (sostituibile con codice per video MP4)."""
-    pil_frames = [Image.fromarray(frame) for frame in frames]
-    pil_frames[0].save(
-        path,
-        save_all=True,
-        append_images=pil_frames[1:],
-        duration=int(1000/fps),
-        loop=0,
-        optimize=True
-    )
+def save_video(frames: List[np.ndarray], path: str, fps: int, target_size: Tuple[int, int]) -> None:
+    """Salva come MP4 con OpenCV"""
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(path, fourcc, fps, target_size)
+    
+    for frame in frames:
+        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        out.write(bgr_frame)
+    
+    out.release()
 
 # --- Interfaccia Utente ---
 def main():
     # Sidebar Controls
     with st.sidebar:
-        st.header("⚙️ Impostazioni")
+        st.header("⚙️ Impostazioni Pro")
         
         # Selezione formato
         aspect_name = st.selectbox("Formato output", list(ASPECT_RATIOS.keys()))
         aspect_ratio = ASPECT_RATIOS[aspect_name]
         
-        # Dimensioni personalizzate
+        # Dimensioni
         if aspect_ratio is None:
             custom_width = st.number_input("Larghezza", 100, 3840, 1920)
             custom_height = st.number_input("Altezza", 100, 2160, 1080)
             target_size = (custom_width, custom_height)
         else:
-            base_res = st.selectbox("Risoluzione base", [480, 720, 1080, 1440], index=2)
+            base_res = st.selectbox("Risoluzione base", [480, 720, 1080, 1440, 2160], index=2)
             width_ratio, height_ratio = aspect_ratio
-            if width_ratio >= height_ratio:  # Landscape o quadrato
+            if width_ratio >= height_ratio:
                 target_size = (int(base_res * width_ratio / height_ratio), base_res)
-            else:  # Portrait
+            else:
                 target_size = (base_res, int(base_res * height_ratio / width_ratio))
         
         # Controlli temporali
-        duration_sec = st.selectbox("Durata totale (secondi)", DURATION_OPTIONS, index=0)
-        fps = st.selectbox("FPS", FPS_OPTIONS, index=1)
+        duration_sec = st.select_slider("Durata totale", options=DURATION_OPTIONS, value=5)
+        fps = st.selectbox("Frame rate (FPS)", FPS_OPTIONS, index=1)
         
-        st.markdown(f"**Frame totali:** {calculate_frames(duration_sec, fps)}")
+        st.markdown(f"""
+        **Info tecniche:**
+        - Frame totali: {calculate_frames(duration_sec, fps)}
+        - Risoluzione: {target_size[0]}x{target_size[1]}
+        - Formato: {aspect_name}
+        """)
     
     # Upload immagini
     uploaded_files = st.file_uploader(
-        f"Carica {MIN_IMAGES}-{MAX_IMAGES} immagini",
+        f"Carica {MIN_IMAGES}-{MAX_IMAGES} immagini (ordine importante)",
         type=SUPPORTED_FORMATS,
         accept_multiple_files=True
     )
@@ -132,6 +154,7 @@ def main():
         # Processa immagini
         images = []
         cols = st.columns(min(len(uploaded_files), 5))
+        
         for i, file in enumerate(uploaded_files[:MAX_IMAGES]):
             with cols[i % 5]:
                 try:
@@ -142,30 +165,32 @@ def main():
                     st.error(f"Errore nell'immagine {i+1}: {str(e)}")
         
         if len(images) >= MIN_IMAGES:
-            if st.button("🎬 Genera Video", type="primary"):
-                with st.spinner(f"Generazione video ({duration_sec} secondi)..."):
+            if st.button("🎬 Genera Video Pro", type="primary"):
+                with st.spinner(f"Generazione video ({duration_sec}s)..."):
                     # Genera tutti i frame
                     all_frames = generate_transitions(images, duration_sec, fps)
                     
                     # Salva temporaneamente
-                    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-                        save_video(all_frames, tmp.name, fps)
-                        
-                        # Mostra risultato
-                        st.success("Completato!")
-                        st.video(tmp.name)
-                        
-                        # Download
-                        with open(tmp.name, "rb") as f:
-                            st.download_button(
-                                "💾 Scarica Video",
-                                f.read(),
-                                file_name=f"morphing_{duration_sec}s_{target_size[0]}x{target_size[1]}.gif",
-                                mime="image/gif"
-                            )
+                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    
+                    save_video(all_frames, tmp_path, fps, target_size)
+                    
+                    # Mostra risultato
+                    st.success(f"Video generato con successo! ({len(all_frames)} frame)")
+                    st.video(tmp_path)
+                    
+                    # Download
+                    with open(tmp_path, "rb") as f:
+                        st.download_button(
+                            "💾 Scarica MP4",
+                            f.read(),
+                            file_name=f"morphing_{duration_sec}s_{target_size[0]}x{target_size[1]}.mp4",
+                            mime="video/mp4"
+                        )
                     
                     # Cleanup
-                    os.unlink(tmp.name)
+                    os.unlink(tmp_path)
 
 if __name__ == "__main__":
     main()
