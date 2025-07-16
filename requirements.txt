@@ -1,4 +1,4 @@
 streamlit
 numpy
 Pillow
-moviepy
+imageio[ffmpeg]
