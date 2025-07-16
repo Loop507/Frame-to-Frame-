@@ -1,17 +1,13 @@
-# app.py - Multi-image transition app
-
 import streamlit as st
 import numpy as np
 from PIL import Image
 import os
 import cv2
-from moviepy.editor import ImageSequenceClip
 import tempfile
-import random
 
-st.set_page_config(page_title="Multi Image Transitions", layout="wide")
+st.set_page_config(page_title="Multi Image Video", layout="wide")
 
-# --- EFFECTS ---
+# --- Effetti semplici ---
 
 def fade_effect(img1, img2, num_frames):
     return [(img1 * (1 - alpha) + img2 * alpha).astype(np.uint8)
@@ -36,46 +32,45 @@ EFFECTS = {
     "Pixel Wave": pixel_wave,
 }
 
-# --- UTILITY ---
-
-def load_image(path, size):
-    img = Image.open(path).convert("RGB")
+def load_image(file, size):
+    img = Image.open(file).convert("RGB")
     return np.array(img.resize(size)).astype(np.float32)
 
-def generate_transitions(images, effect_name, num_frames, loop_back):
+def generate_transitions(images, effect_fn, num_frames, loop_back):
     frames = []
-    effect_fn = EFFECTS[effect_name]
     for i in range(len(images) - 1):
         frames += effect_fn(images[i], images[i + 1], num_frames)
     if loop_back:
         frames += effect_fn(images[-1], images[0], num_frames)
     return frames
 
-# --- UI ---
+def save_video(frames, path, fps=30):
+    h, w, _ = frames[0].shape
+    out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+    for f in frames:
+        out.write(cv2.cvtColor(f.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    out.release()
 
-st.title("🎞️ Slideshow con Transizioni ed Effetti")
+# --- UI Streamlit ---
 
-uploaded_images = st.file_uploader("Carica 2 o più immagini", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+st.title("🎥 Slideshow Video con Transizioni")
 
-effect_choice = st.selectbox("Scegli effetto", list(EFFECTS.keys()))
-num_frames = st.slider("Fotogrammi per transizione", 10, 120, 30)
-loop_back = st.checkbox("Loop finale (ultima → prima immagine)")
-generate = st.button("🎬 Genera video")
+uploaded_images = st.file_uploader("Carica almeno 2 immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+effect = st.selectbox("Effetto di transizione", list(EFFECTS.keys()))
+frames_per_transition = st.slider("Fotogrammi per transizione", 10, 120, 30)
+loop = st.checkbox("Loop da ultima a prima immagine")
+generate = st.button("🎬 Crea Video")
 
 if generate and uploaded_images and len(uploaded_images) >= 2:
-    with st.spinner("⏳ Elaborazione..."):
-
+    with st.spinner("Generazione in corso..."):
         size = (640, 480)
         images = [load_image(img, size) for img in uploaded_images]
-        all_frames = generate_transitions(images, effect_choice, num_frames, loop_back)
+        all_frames = generate_transitions(images, EFFECTS[effect], frames_per_transition, loop)
 
-        tmpdir = tempfile.mkdtemp()
-        output_path = os.path.join(tmpdir, "slideshow.mp4")
-        clip = ImageSequenceClip([frame.astype(np.uint8) for frame in all_frames], fps=30)
-        clip.write_videofile(output_path, codec='libx264', audio=False, verbose=False, logger=None)
+        tmp_path = os.path.join(tempfile.gettempdir(), "output.mp4")
+        save_video(all_frames, tmp_path)
 
-    st.success("✅ Video pronto!")
-    st.video(output_path)
+        st.success("✅ Video creato!")
+        st.video(tmp_path)
 else:
-    st.info("Carica almeno due immagini per iniziare.")
-
+    st.info("Carica almeno due immagini per continuare.")
