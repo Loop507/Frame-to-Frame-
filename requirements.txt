@@ -1,5 +1,4 @@
-opencv-python
+streamlit
+moviepy
 numpy
 Pillow
-streamlit
-tqdm
