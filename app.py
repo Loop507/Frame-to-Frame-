@@ -1,10 +1,10 @@
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import ImageSequenceClip
+import imageio
 import os
 
-# --- Effetti ---
+# --- Effetti di transizione ---
 
 def fade_transition(img1, img2, num_frames):
     arr1 = np.array(img1).astype(np.float32)
@@ -18,26 +18,24 @@ def fade_transition(img1, img2, num_frames):
 
 def zoom_transition(img1, img2, num_frames, zoom_factor=1.5):
     w, h = img1.size
-    arr1 = np.array(img1).astype(np.float32)
-    arr2 = np.array(img2).astype(np.float32)
     frames = []
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         scale = 1 + (zoom_factor - 1) * alpha
-        
         new_w, new_h = int(w * scale), int(h * scale)
-        img1_zoomed = img1.resize((new_w, new_h), Image.LANCZOS)
-        img2_zoomed = img2.resize((new_w, new_h), Image.LANCZOS)
-        
+
+        img1_zoom = img1.resize((new_w, new_h), Image.LANCZOS)
+        img2_zoom = img2.resize((new_w, new_h), Image.LANCZOS)
+
         left = (new_w - w) // 2
         top = (new_h - h) // 2
-        img1_crop = img1_zoomed.crop((left, top, left + w, top + h))
-        img2_crop = img2_zoomed.crop((left, top, left + w, top + h))
-        
-        arr1_crop = np.array(img1_crop).astype(np.float32)
-        arr2_crop = np.array(img2_crop).astype(np.float32)
-        
-        blended = (arr1_crop * (1 - alpha) + arr2_crop * alpha).astype(np.uint8)
+
+        img1_crop = img1_zoom.crop((left, top, left + w, top + h))
+        img2_crop = img2_zoom.crop((left, top, left + w, top + h))
+
+        arr1 = np.array(img1_crop).astype(np.float32)
+        arr2 = np.array(img2_crop).astype(np.float32)
+        blended = (arr1 * (1 - alpha) + arr2 * alpha).astype(np.uint8)
         frames.append(blended)
     return frames
 
@@ -47,11 +45,9 @@ def pixel_random_transition(img1, img2, num_frames):
     h, w, c = arr1.shape
     total_pixels = h * w
     frames = []
-    
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         num_swap = int(total_pixels * alpha)
-        
         frame = arr1.copy()
         ys = np.random.randint(0, h, num_swap)
         xs = np.random.randint(0, w, num_swap)
@@ -173,6 +169,14 @@ def add_text_to_frame(frame_np, text, font_size=40, color=(255,255,255), positio
     draw.text(position, text, fill=color, font=font)
     return np.array(img)
 
+# --- Funzione per scrivere video con imageio ---
+
+def write_video_imageio(frames, fps, output_path):
+    with imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8) as writer:
+        for frame in frames:
+            writer.append_data(frame)
+    return output_path
+
 # --- Streamlit App ---
 
 st.title("🎥 Video MP4 con molti effetti di transizione")
@@ -232,9 +236,8 @@ if img1_file and img2_file:
         if add_text and text_content.strip():
             frames = [add_text_to_frame(f, text_content) for f in frames]
 
-        clip = ImageSequenceClip([Image.fromarray(f) for f in frames], fps=fps)
         output_path = "output.mp4"
-        clip.write_videofile(output_path, codec="libx264", audio=False, verbose=False, logger=None)
+        write_video_imageio(frames, fps, output_path)
 
         with open(output_path, "rb") as f:
             video_bytes = f.read()
