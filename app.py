@@ -9,8 +9,15 @@ import traceback
 import math
 import random
 
-st.set_page_config(page_title="🎞️ Morphing Studio", layout="wide")
-st.title("🔄 Morphing Studio - Effetti Avanzati")
+st.set_page_config(page_title="🎞️ Frame to Frame", layout="wide")
+
+# Titolo personalizzato con HTML
+st.markdown("""
+    <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #1f77b4; font-size: 3rem; margin-bottom: 5px;">🎞️ Frame to Frame</h1>
+        <p style="color: #666; font-size: 1.2rem; margin-top: 0;">by Loop507</p>
+    </div>
+""", unsafe_allow_html=True)
 
 SUPPORTED_FORMATS = ["jpg", "jpeg", "png", "bmp", "webp"]
 DEFAULT_FPS = 30
@@ -22,6 +29,13 @@ ASPECT_RATIOS = {
     "3:4 (Portrait Classic)": (3, 4),
     "21:9 (Ultrawide)": (21, 9),
     "Custom": None
+}
+
+# Intensità effetti
+EFFECT_INTENSITIES = {
+    "Soft": 0.3,
+    "Medium": 0.6,
+    "Hard": 1.0
 }
 
 def load_image(uploaded_file) -> Optional[np.ndarray]:
@@ -65,16 +79,18 @@ def resize_to_target(img: np.ndarray, target_size: Tuple[int, int]) -> Optional[
         st.error(f"❌ Errore nel ridimensionamento: {str(e)}")
         return None
 
-def linear_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def linear_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing lineare semplice."""
     frames = []
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
-        morphed = (1 - alpha) * img1 + alpha * img2
+        # Applica intensità
+        smooth_alpha = alpha * intensity + (1 - intensity) * 0.5
+        morphed = (1 - smooth_alpha) * img1 + smooth_alpha * img2
         frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
     return frames
 
-def wave_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def wave_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto onda."""
     h, w = img1.shape[:2]
     frames = []
@@ -85,8 +101,8 @@ def wave_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
         # Crea griglia di coordinate
         x, y = np.meshgrid(np.arange(w), np.arange(h))
         
-        # Effetto onda
-        wave_intensity = 20 * np.sin(alpha * np.pi)
+        # Effetto onda con intensità variabile
+        wave_intensity = 20 * intensity * np.sin(alpha * np.pi)
         dx = wave_intensity * np.sin(2 * np.pi * y / h + alpha * 4 * np.pi)
         dy = wave_intensity * np.cos(2 * np.pi * x / w + alpha * 4 * np.pi)
         
@@ -104,7 +120,7 @@ def wave_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
     
     return frames
 
-def spiral_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def spiral_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto spirale."""
     h, w = img1.shape[:2]
     frames = []
@@ -122,8 +138,8 @@ def spiral_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
         radius = np.sqrt(dx**2 + dy**2)
         angle = np.arctan2(dy, dx)
         
-        # Effetto spirale
-        spiral_factor = alpha * 2 * np.pi
+        # Effetto spirale con intensità
+        spiral_factor = alpha * 2 * np.pi * intensity
         angle_new = angle + spiral_factor * (radius / max(w, h))
         
         # Riconverti in coordinate cartesiane
@@ -143,7 +159,7 @@ def spiral_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
     
     return frames
 
-def zoom_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def zoom_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto zoom."""
     h, w = img1.shape[:2]
     frames = []
@@ -152,8 +168,8 @@ def zoom_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         
-        # Effetto zoom
-        zoom_factor = 1 + 0.5 * np.sin(alpha * np.pi)
+        # Effetto zoom con intensità
+        zoom_factor = 1 + (0.5 * intensity) * np.sin(alpha * np.pi)
         
         # Crea matrice di trasformazione
         M = cv2.getRotationMatrix2D((center_x, center_y), 0, zoom_factor)
@@ -168,7 +184,7 @@ def zoom_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
     
     return frames
 
-def glitch_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def glitch_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto glitch digitale."""
     h, w = img1.shape[:2]
     frames = []
@@ -179,13 +195,13 @@ def glitch_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
         # Base morphing
         base_morph = (1 - alpha) * img1 + alpha * img2
         
-        # Effetto glitch
-        glitch_intensity = 0.3 * np.sin(alpha * np.pi * 4)
+        # Effetto glitch con intensità
+        glitch_intensity = 0.3 * intensity * np.sin(alpha * np.pi * 4)
         
         if abs(glitch_intensity) > 0.1:
             # Shift di canali RGB
             result = base_morph.copy()
-            shift = int(glitch_intensity * 20)
+            shift = int(glitch_intensity * 20 * intensity)
             
             # Shift canale rosso
             if shift > 0:
@@ -200,13 +216,14 @@ def glitch_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
                 result[:, -shift:, 2] = base_morph[:, :shift, 2]
             
             # Linee orizzontali random
-            for _ in range(random.randint(1, 5)):
+            num_lines = int(random.randint(1, 5) * intensity)
+            for _ in range(num_lines):
                 y = random.randint(0, h - 1)
                 thickness = random.randint(1, 3)
                 end_y = min(y + thickness, h)
                 
                 # Shift orizzontale della linea
-                line_shift = random.randint(-30, 30)
+                line_shift = int(random.randint(-30, 30) * intensity)
                 if line_shift > 0:
                     result[y:end_y, line_shift:] = base_morph[y:end_y, :-line_shift]
                 elif line_shift < 0:
@@ -218,21 +235,21 @@ def glitch_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
     
     return frames
 
-def swap_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def swap_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto scambio a blocchi."""
     h, w = img1.shape[:2]
     frames = []
     
-    # Dimensione dei blocchi
-    block_size = min(w, h) // 8
+    # Dimensione dei blocchi basata su intensità
+    block_size = min(w, h) // int(8 * intensity + 2)
     
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         
         result = img1.copy()
         
-        # Numero di blocchi da scambiare basato su alpha
-        num_blocks = int(alpha * (h // block_size) * (w // block_size))
+        # Numero di blocchi da scambiare basato su alpha e intensità
+        num_blocks = int(alpha * intensity * (h // block_size) * (w // block_size))
         
         blocks_swapped = 0
         for y in range(0, h, block_size):
@@ -241,7 +258,7 @@ def swap_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
                     break
                 
                 # Determina se scambiare questo blocco
-                if random.random() < alpha:
+                if random.random() < alpha * intensity:
                     y_end = min(y + block_size, h)
                     x_end = min(x + block_size, w)
                     
@@ -256,7 +273,7 @@ def swap_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.n
     
     return frames
 
-def pixel_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def pixel_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto pixelato."""
     h, w = img1.shape[:2]
     frames = []
@@ -264,8 +281,8 @@ def pixel_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         
-        # Calcola il livello di pixelizzazione
-        pixel_level = int(2 + 30 * np.sin(alpha * np.pi))
+        # Calcola il livello di pixelizzazione con intensità
+        pixel_level = int(2 + 30 * intensity * np.sin(alpha * np.pi))
         
         # Base morphing
         base_morph = (1 - alpha) * img1 + alpha * img2
@@ -283,7 +300,7 @@ def pixel_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.
     
     return frames
 
-def distorted_lines_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def distorted_lines_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con linee distorte."""
     h, w = img1.shape[:2]
     frames = []
@@ -295,12 +312,13 @@ def distorted_lines_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -
         base_morph = (1 - alpha) * img1 + alpha * img2
         result = base_morph.copy()
         
-        # Effetto linee distorte
-        distortion_intensity = 0.5 * np.sin(alpha * np.pi * 3)
+        # Effetto linee distorte con intensità
+        distortion_intensity = 0.5 * intensity * np.sin(alpha * np.pi * 3)
         
         if abs(distortion_intensity) > 0.1:
             # Linee orizzontali distorte
-            for y in range(0, h, 10):
+            line_spacing = int(10 / intensity) if intensity > 0 else 10
+            for y in range(0, h, line_spacing):
                 if y < h:
                     # Crea distorsione sinusoidale
                     distortion = distortion_intensity * 30 * np.sin(np.arange(w) * 2 * np.pi / w * 5)
@@ -316,12 +334,12 @@ def distorted_lines_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -
     
     return frames
 
-def slice_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def slice_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto slice (fette)."""
     h, w = img1.shape[:2]
     frames = []
     
-    slice_width = w // 20  # Larghezza di ogni slice
+    slice_width = w // int(20 * intensity)  # Più slice con intensità alta
     
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
@@ -329,14 +347,14 @@ def slice_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.
         result = img1.copy()
         
         # Numero di slice da sostituire
-        num_slices = int(alpha * (w // slice_width))
+        num_slices = int(alpha * intensity * (w // slice_width))
         
         for slice_idx in range(num_slices):
             x_start = slice_idx * slice_width
             x_end = min(x_start + slice_width, w)
             
             # Offset verticale per effetto dinamico
-            offset = int(20 * np.sin(alpha * np.pi * 2 + slice_idx * 0.5))
+            offset = int(20 * intensity * np.sin(alpha * np.pi * 2 + slice_idx * 0.5))
             
             # Applica slice con offset
             for y in range(h):
@@ -347,7 +365,7 @@ def slice_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.
     
     return frames
 
-def rotation_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def rotation_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto rotazione."""
     h, w = img1.shape[:2]
     frames = []
@@ -356,8 +374,8 @@ def rotation_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[
     for i in range(num_frames):
         alpha = i / (num_frames - 1)
         
-        # Angolo di rotazione
-        angle = alpha * 360 * 2  # Due rotazioni complete
+        # Angolo di rotazione con intensità
+        angle = alpha * 360 * 2 * intensity  # Rotazioni variabili
         
         # Matrice di rotazione
         M = cv2.getRotationMatrix2D((center_x, center_y), angle, 1.0)
@@ -372,7 +390,7 @@ def rotation_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[
     
     return frames
 
-def ripple_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np.ndarray]:
+def ripple_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
     """Morphing con effetto ripple (increspatura)."""
     h, w = img1.shape[:2]
     frames = []
@@ -384,7 +402,7 @@ def ripple_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
         # Base morphing
         base_morph = (1 - alpha) * img1 + alpha * img2
         
-        # Effetto ripple
+        # Effetto ripple con intensità
         x, y = np.meshgrid(np.arange(w), np.arange(h))
         
         # Distanza dal centro
@@ -393,9 +411,9 @@ def ripple_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
         distance = np.sqrt(dx**2 + dy**2)
         
         # Parametri ripple
-        ripple_amplitude = 15 * np.sin(alpha * np.pi)
-        ripple_frequency = 0.1
-        ripple_speed = alpha * 10
+        ripple_amplitude = 15 * intensity * np.sin(alpha * np.pi)
+        ripple_frequency = 0.1 * intensity
+        ripple_speed = alpha * 10 * intensity
         
         # Calcola distorsione
         distortion = ripple_amplitude * np.sin(distance * ripple_frequency + ripple_speed)
@@ -417,7 +435,36 @@ def ripple_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int) -> List[np
     
     return frames
 
-def generate_morph_with_progress(img1: np.ndarray, img2: np.ndarray, num_frames: int, effect: str):
+def random_morph(img1: np.ndarray, img2: np.ndarray, num_frames: int, intensity: float = 1.0) -> List[np.ndarray]:
+    """Morphing con effetto casuale che cambia dinamicamente."""
+    # Lista di tutti gli effetti disponibili
+    effects = [
+        wave_morph, spiral_morph, zoom_morph, glitch_morph, 
+        swap_morph, pixel_morph, distorted_lines_morph, 
+        slice_morph, rotation_morph, ripple_morph
+    ]
+    
+    # Divide i frame in segmenti casuali
+    segments = random.randint(3, 6)  # 3-6 segmenti diversi
+    frames_per_segment = num_frames // segments
+    
+    all_frames = []
+    
+    for segment in range(segments):
+        start_frame = segment * frames_per_segment
+        end_frame = (segment + 1) * frames_per_segment if segment < segments - 1 else num_frames
+        segment_frames = end_frame - start_frame
+        
+        # Scegli un effetto casuale per questo segmento
+        effect_function = random.choice(effects)
+        
+        # Genera i frame per questo segmento
+        segment_result = effect_function(img1, img2, segment_frames, intensity)
+        all_frames.extend(segment_result)
+    
+    return all_frames
+
+def generate_morph_with_progress(img1: np.ndarray, img2: np.ndarray, num_frames: int, effect: str, intensity: float = 1.0):
     """Genera morphing con barra di progresso."""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -435,17 +482,18 @@ def generate_morph_with_progress(img1: np.ndarray, img2: np.ndarray, num_frames:
             "Distorted Lines": distorted_lines_morph,
             "Slice": slice_morph,
             "Rotation": rotation_morph,
-            "Ripple": ripple_morph
+            "Ripple": ripple_morph,
+            "Random": random_morph
         }
         
         morph_function = effect_functions.get(effect, linear_morph)
-        frames = morph_function(img1, img2, num_frames)
+        frames = morph_function(img1, img2, num_frames, intensity)
         
         # Simula progresso
         for i in range(num_frames):
             progress = (i + 1) / num_frames
             progress_bar.progress(progress)
-            status_text.text(f"Generazione frame {i + 1}/{num_frames} - Effetto: {effect}")
+            status_text.text(f"Generazione frame {i + 1}/{num_frames} - Effetto: {effect} ({intensity:.1f})")
         
         progress_bar.empty()
         status_text.empty()
@@ -518,8 +566,21 @@ def main():
     effect = st.sidebar.selectbox("Tipo di Morphing", [
         "Linear", "Wave", "Spiral", "Zoom", 
         "Glitch", "Swap", "Pixel", "Distorted Lines", 
-        "Slice", "Rotation", "Ripple"
+        "Slice", "Rotation", "Ripple", "Random"
     ])
+    
+    # Intensity control
+    st.sidebar.header("🔥 Intensità Effetto")
+    intensity_level = st.sidebar.selectbox("Livello di Intensità", ["Soft", "Medium", "Hard"])
+    intensity = EFFECT_INTENSITIES[intensity_level]
+    
+    # Show intensity info
+    intensity_info = {
+        "Soft": "🌸 Effetto delicato e sottile",
+        "Medium": "⚡ Effetto bilanciato",
+        "Hard": "🔥 Effetto intenso e drammatico"
+    }
+    st.sidebar.info(intensity_info[intensity_level])
     
     # Export format
     export_format = st.sidebar.selectbox("💾 Formato", ["MP4", "GIF"])
@@ -568,7 +629,7 @@ def main():
             transitions = num_images - 1
             frames_per_transition = num_frames // transitions
             
-            st.info(f"🎬 Generando {transitions} transizioni con {frames_per_transition} frame ciascuna")
+            st.info(f"🎬 Generando {transitions} transizioni con {frames_per_transition} frame ciascuna - Intensità: {intensity_level}")
             
             all_frames = []
             
@@ -580,134 +641,144 @@ def main():
                     images[i], 
                     images[i+1], 
                     frames_per_transition, 
-                    effect
+                    effect,
+                    intensity
                 )
                 
                 if not frames:
                     st.error(f"❌ Errore nella transizione {i+1}")
-                    return
+return
                 
                 all_frames.extend(frames)
             
-            st.success(f"✅ Morphing completato! {len(all_frames)} frame totali generati")
-            
-            # Save and display result
-            temp_file = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=f".{export_format.lower()}", delete=False) as tmp:
-                    temp_file = tmp.name
+            if all_frames:
+                st.success(f"✅ {len(all_frames)} frame generati con successo!")
+                
+                # Show preview
+                st.subheader("🎬 Preview")
+                preview_container = st.container()
+                
+                with preview_container:
+                    col1, col2, col3 = st.columns([1, 2, 1])
+                    with col2:
+                        # Show first, middle, and last frames
+                        preview_frames = [
+                            all_frames[0],
+                            all_frames[len(all_frames)//2],
+                            all_frames[-1]
+                        ]
+                        
+                        for idx, frame in enumerate(preview_frames):
+                            frame_labels = ["🎬 Primo Frame", "🎯 Frame Centrale", "🏁 Ultimo Frame"]
+                            st.image(frame, caption=frame_labels[idx], use_container_width=True)
+                
+                # Save and download
+                st.subheader("💾 Download")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{export_format.lower()}") as tmp_file:
+                    if export_format == "MP4":
+                        success = save_as_mp4(all_frames, tmp_file.name, fps)
+                    else:
+                        success = save_as_gif(all_frames, tmp_file.name, fps)
                     
-                    with st.spinner(f"💾 Salvataggio {export_format}..."):
-                        if export_format == "GIF":
-                            success = save_as_gif(all_frames, temp_file, fps)
-                            file_label = f"morphing_{num_images}images_{duration_seconds}s_{effect.lower()}.gif"
-                            mime_type = "image/gif"
-                        else:
-                            success = save_as_mp4(all_frames, temp_file, fps)
-                            file_label = f"morphing_{num_images}images_{duration_seconds}s_{effect.lower()}.mp4"
-                            mime_type = "video/mp4"
-                    
-                    if not success:
-                        st.error("❌ Errore nel salvataggio")
-                        return
-                    
-                    # Download button (no preview)
-                    with open(temp_file, "rb") as f:
+                    if success:
+                        with open(tmp_file.name, "rb") as f:
+                            file_data = f.read()
+                        
+                        file_size = len(file_data) / (1024 * 1024)  # Size in MB
+                        st.success(f"✅ File generato: {file_size:.2f} MB")
+                        
+                        # Download button
                         st.download_button(
-                            f"📥 Scarica {export_format} ({duration_seconds}s)",
-                            f.read(),
-                            file_name=file_label,
-                            mime=mime_type,
-                            type="primary",
+                            label=f"📥 Scarica {export_format}",
+                            data=file_data,
+                            file_name=f"morphing_{effect.lower()}_{intensity_level.lower()}.{export_format.lower()}",
+                            mime=f"video/{export_format.lower()}" if export_format == "MP4" else "image/gif",
                             use_container_width=True
                         )
+                        
+                        # Technical info
+                        with st.expander("🔧 Informazioni Tecniche"):
+                            st.write(f"**Risoluzione:** {target_width}x{target_height}")
+                            st.write(f"**FPS:** {fps}")
+                            st.write(f"**Durata:** {duration_seconds} secondi")
+                            st.write(f"**Frame totali:** {len(all_frames)}")
+                            st.write(f"**Effetto:** {effect}")
+                            st.write(f"**Intensità:** {intensity_level} ({intensity})")
+                            st.write(f"**Formato:** {export_format}")
+                            st.write(f"**Dimensione file:** {file_size:.2f} MB")
+                            st.write(f"**Transizioni:** {transitions}")
                     
-                    # File info
-                    file_size = os.path.getsize(temp_file)
-                    st.info(f"ℹ️ File: {file_label} | Dimensioni: {file_size/1024/1024:.1f} MB | {fps} FPS | {len(all_frames)} frame | Effetto: {effect}")
-                    
-            except Exception as e:
-                st.error(f"❌ Errore imprevisto: {str(e)}")
-                st.code(traceback.format_exc())
-            finally:
-                if temp_file and os.path.exists(temp_file):
+                    # Cleanup
                     try:
-                        os.unlink(temp_file)
+                        os.unlink(tmp_file.name)
                     except:
                         pass
-    else:
-        st.info("👆 Carica almeno 2 immagini per iniziare")
+            else:
+                st.error("❌ Nessun frame generato")
         
-        # Show example with new effects
-        st.header("🎯 Nuovi Effetti Disponibili")
+        # Show loaded images preview
+        st.subheader("🖼️ Anteprima Immagini")
+        cols = st.columns(min(len(images), 5))
+        for i, img in enumerate(images):
+            with cols[i % 5]:
+                st.image(img, caption=f"Immagine {i+1}", use_container_width=True)
+            
+            # Show next row if more than 5 images
+            if (i + 1) % 5 == 0 and i + 1 < len(images):
+                cols = st.columns(min(len(images) - i - 1, 5))
+    
+    else:
+        # Show demo/help section
+        st.header("🎯 Come Funziona")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.write("**🎨 Effetti Classici**")
-            st.write("• Linear - Transizione lineare")
-            st.write("• Wave - Effetto onda")
-            st.write("• Spiral - Effetto spirale")
-            st.write("• Zoom - Effetto zoom")
-            st.write("• Rotation - Rotazione dinamica")
-            st.write("• Ripple - Increspatura")
+            st.markdown("""
+            ### 📝 Istruzioni
+            1. **Carica le immagini**: Seleziona 2-10 immagini
+            2. **Scegli l'aspect ratio**: Personalizza le dimensioni
+            3. **Imposta la durata**: Controlla velocità e FPS
+            4. **Seleziona l'effetto**: Scegli tra 12 effetti diversi
+            5. **Regola l'intensità**: Soft, Medium o Hard
+            6. **Genera e scarica**: MP4 o GIF
+            """)
         
         with col2:
-            st.write("**🔥 Effetti Avanzati**")
-            st.write("• Glitch - Distorsione digitale")
-            st.write("• Swap - Scambio a blocchi")
-            st.write("• Pixel - Effetto pixelato")
-            st.write("• Distorted Lines - Linee distorte")
-            st.write("• Slice - Effetto a fette")
+            st.markdown("""
+            ### 🎨 Effetti Disponibili
+            - **Linear**: Transizione fluida classica
+            - **Wave**: Effetto ondulatorio
+            - **Spiral**: Rotazione spirale
+            - **Zoom**: Ingrandimento dinamico
+            - **Glitch**: Distorsione digitale
+            - **Swap**: Scambio a blocchi
+            - **Pixel**: Effetto pixelato
+            - **Distorted Lines**: Linee distorte
+            - **Slice**: Effetto a fette
+            - **Rotation**: Rotazione continua
+            - **Ripple**: Increspatura radiale
+            - **Random**: Mix di effetti casuali
+            """)
         
-        st.header("⚡ Caratteristiche")
-st.write("""
-- 🎨 **11 effetti di morphing** inclusi Linear, Wave, Spiral, Zoom, Glitch, Swap, Pixel, Distorted Lines, Slice, Rotation, Ripple
-- 📱 **Aspect ratio multipli** - 1:1, 16:9, 9:16, 4:3, 3:4, 21:9, Custom
-- 🎬 **Esportazione MP4 e GIF** con qualità ottimizzata
-- ⚡ **Elaborazione veloce** con barra di progresso
-- 🖼️ **Supporto multi-immagine** (2-10 immagini)
-- 🎛️ **Controlli avanzati** per FPS, durata e dimensioni
-- 🔄 **Transizioni fluide** tra immagini multiple
-- 💾 **Download diretto** senza preview per file di grandi dimensioni
-""")
-
-st.header("📖 Come Usare")
-st.write("""
-1. **Carica le immagini** - Seleziona 2-10 immagini (JPG, PNG, BMP, WEBP)
-2. **Configura le impostazioni** - Aspect ratio, durata, FPS, effetto
-3. **Genera il morphing** - Clicca il pulsante per iniziare l'elaborazione
-4. **Scarica il risultato** - Download automatico del file MP4 o GIF
-""")
-
-st.header("🔧 Impostazioni Consigliate")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.write("**🎬 Per Video (MP4)**")
-    st.write("• FPS: 24-30")
-    st.write("• Durata: 3-10 secondi")
-    st.write("• Risoluzione: 1920x1080")
-    st.write("• Effetti: Linear, Wave, Spiral")
-
-with col2:
-    st.write("**🎞️ Per GIF**")
-    st.write("• FPS: 15-20")
-    st.write("• Durata: 2-5 secondi")
-    st.write("• Risoluzione: 800x600")
-    st.write("• Effetti: Glitch, Pixel, Swap")
-
-st.header("⚠️ Note Importanti")
-st.info("""
-- **Dimensioni file**: I file MP4 sono più piccoli dei GIF
-- **Performance**: Riduci FPS/durata per file più leggeri
-- **Qualità**: Immagini di qualità simile danno risultati migliori
-- **Memoria**: Elaborazione limitata dalle risorse disponibili
-""")
+        st.markdown("""
+        ### 🎬 Suggerimenti
+        - **Immagini simili**: Migliori risultati con soggetti simili
+        - **Aspect ratio**: Mantieni coerenza per evitare distorsioni
+        - **Intensità**: Inizia con "Medium" per un buon equilibrio
+        - **FPS**: 24-30 FPS per fluidità, 15-20 per file più piccoli
+        - **Durata**: 3-7 secondi sono ideali per la maggior parte degli usi
+        """)
 
 # Footer
 st.markdown("---")
-st.markdown("**🎨 Morphing Studio** - Creato con ❤️ usando Streamlit")
+st.markdown("""
+<div style="text-align: center; color: #666; padding: 20px;">
+<p>🎬 <strong>Frame to Frame</strong> - Crea morphing video straordinari</p>
+<p>Made with ❤️ by Loop507</p>
+</div>
+""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
