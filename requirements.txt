@@ -1,4 +1,5 @@
-opencv-python
+streamlit
 numpy
-pillow
+Pillow
+opencv-python-headless
 imageio
