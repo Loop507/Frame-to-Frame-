@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image
-import imageio
+import imageio.v3 as iio
 import os
 import tempfile
 import random
@@ -56,10 +56,11 @@ with col1:
 with col2:
     output_format = st.selectbox("Formato output", ["1:1", "9:16", "16:9"])
 
-num_frames = st.slider("Numero di frame per transizione", 5, 60, 20)
-video_duration = st.selectbox("Durata video (secondi)", [5, 10, 15, 20], index=1)
+duration_sec = st.slider("Durata totale del video (secondi)", 1, 30, 5)
 fps = 24
+num_total_frames = duration_sec * fps
 
+num_frames = st.slider("Frame per transizione", 5, 60, 20)
 effect_choice = st.selectbox("Effetto", ["Fade", "Morph", "Glitch", "Random"])
 effect_strength = st.selectbox("Intensità Effetto", ["Soft", "Medio", "Hard"])
 
@@ -80,10 +81,10 @@ if uploaded_files and len(uploaded_files) >= 2:
     n_frames = strength_map[effect_strength]
 
     st.info("Generazione video in corso...")
-    progress = st.progress(0)
+    progress = st.progress(0.0)
 
     for i in range(len(images) - 1):
-        img1, img2 = images[i], images[i+1]
+        img1, img2 = images[i], images[i + 1]
 
         if effect_choice == "Fade":
             frames = fade_effect(img1, img2, n_frames)
@@ -100,14 +101,12 @@ if uploaded_files and len(uploaded_files) >= 2:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
         filepath = tmpfile.name
 
-    writer = imageio.get_writer(filepath, fps=fps)
-    for frame in tqdm(all_frames):
-        writer.append_data(frame)
-    writer.close()
+    try:
+        iio.imwrite(filepath, all_frames, fps=fps, codec="libx264", quality=8)
+        st.success("✅ Video generato con successo!")
+        st.video(filepath, format="video/mp4")
+    except Exception as e:
+        st.error(f"Errore nella scrittura del video: {e}")
 
-    st.success("✅ Video generato con successo!")
-    thumbnail = Image.fromarray(all_frames[len(all_frames) // 2]).resize((240, 135))
-    st.image(thumbnail, caption="🎞️ Anteprima leggera", use_container_width=False)
-    st.video(filepath)
 else:
     st.warning("Carica almeno due immagini per iniziare.")
