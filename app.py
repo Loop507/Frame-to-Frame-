@@ -3,7 +3,6 @@ import numpy as np
 import cv2
 from PIL import Image
 import imageio
-import os
 import tempfile
 import random
 from tqdm import tqdm
@@ -11,6 +10,7 @@ from tqdm import tqdm
 st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator by Loop507", layout="wide")
 
 # --- EFFETTI ---
+
 def fade_effect(img1, img2, num_frames, intensity):
     img1 = img1.astype(np.float32)
     img2 = img2.astype(np.float32)
@@ -51,7 +51,10 @@ def corrupt_lines_effect(img1, img2, num_frames, intensity):
         for _ in range(intensity):
             x = random.randint(0, w - 10)
             y = random.randint(0, h - 1)
-            frame[y:y+1, x:x+random.randint(5, 15)] = np.random.randint(0, 255, (1, min(15, w - x), 3), dtype=np.uint8)
+            line_length = random.randint(5, 15)
+            line_length = min(line_length, w - x)  # Correzione per non sforare i limiti
+            noise = np.random.randint(0, 255, (1, line_length, 3), dtype=np.uint8)
+            frame[y:y+1, x:x+line_length] = noise
         frames.append(frame)
     return frames
 
@@ -91,7 +94,7 @@ def zoom_random_effect(img1, img2, num_frames, intensity):
         zimg1 = cv2.warpAffine(img1, M, (w, h))
         zimg2 = cv2.warpAffine(img2, M, (w, h))
         frame = cv2.addWeighted(zimg1, 1 - alpha, zimg2, alpha, 0)
-        frames.append(frame)
+        frames.append(frame.astype(np.uint8))
     return frames
 
 def color_echo_effect(img1, img2, num_frames, intensity):
@@ -130,7 +133,19 @@ def distorted_slide_effect(img1, img2, num_frames, intensity):
         frames.append(frame)
     return frames
 
-# --- EFFETTI DISPONIBILI ---
+def film_grain_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    for alpha in np.linspace(0, 1, num_frames):
+        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0).astype(np.uint8)
+        noise = np.random.normal(0, intensity, (h, w)).astype(np.uint8)
+        noise = cv2.cvtColor(noise, cv2.COLOR_GRAY2BGR)
+        frame = cv2.addWeighted(frame, 0.9, noise, 0.1, 0)
+        frames.append(frame)
+    return frames
+
+# --- DIZIONARIO EFFETTI ---
+
 effect_funcs = {
     "Fade": fade_effect,
     "Morph": morph_effect,
@@ -142,29 +157,23 @@ effect_funcs = {
     "Zoom Random": zoom_random_effect,
     "Color Echo": color_echo_effect,
     "Particle Float": particle_float_effect,
-    "Distorted Slide": distorted_slide_effect
+    "Distorted Slide": distorted_slide_effect,
+    "Film Grain": film_grain_effect
 }
 
-# --- INTERFACCIA ---
+# --- INTERFACCIA UTENTE ---
+
 st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 uploaded_files = st.file_uploader("Carica almeno 2 immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 effect_choice = st.selectbox("Scegli l'effetto", list(effect_funcs.keys()))
-format_choice = st.selectbox("Formato video", ["1:1", "16:9", "9:16"])
 duration = st.slider("Durata video (in secondi)", 1, 20, 5)
 intensity = st.slider("Intensità effetto", 1, 50, 15)
 video_btn = st.button("🎬 Genera Video")
 
 if video_btn and uploaded_files and len(uploaded_files) >= 2:
-    format_dims = {
-        "1:1": (512, 512),
-        "16:9": (640, 360),
-        "9:16": (360, 640)
-    }
-    target_size = format_dims[format_choice]
-
     images = [np.array(Image.open(file).convert("RGB")) for file in uploaded_files]
-    images = [cv2.resize(img, target_size) for img in images]
+    images = [cv2.resize(img, (512, 512)) for img in images]
 
     frames_per_transition = int(24 * duration / (len(images) - 1))
     all_frames = []
