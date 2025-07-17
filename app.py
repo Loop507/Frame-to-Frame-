@@ -1,4 +1,4 @@
-""import streamlit as st
+import streamlit as st
 import numpy as np
 import cv2
 from PIL import Image
@@ -126,7 +126,8 @@ def combo_effect_preset2(img1, img2, num_frames, intensity):
     return wave_distort_effect(*args := (img1, img2, num_frames, intensity)) + color_echo_effect(*args) + particle_float_effect(*args)
 
 def combo_effect_preset3(img1, img2, num_frames, intensity):
-    return cinematic_morph_effect(*args := (img1, img2, num_frames, intensity)) + light_streaks_effect(*args) + motion_blur_effect(*args) + zoom_random_effect(*args)
+    # Presuppone che cinematic_morph_effect, light_streaks_effect, motion_blur_effect siano definiti, altrimenti sostituisci con effetti esistenti
+    return morph_effect(*args := (img1, img2, num_frames, intensity)) + color_echo_effect(*args) + particle_float_effect(*args) + zoom_random_effect(*args)
 
 # --- EFFETTI DISPONIBILI ---
 effect_funcs = {
