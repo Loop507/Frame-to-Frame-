@@ -1,6 +1,6 @@
 streamlit
 numpy
-Pillow
 opencv-python-headless
+Pillow
 imageio[ffmpeg]
-
+tqdm
