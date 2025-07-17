@@ -4,4 +4,3 @@ Pillow
 opencv-python-headless
 imageio[ffmpeg]
 
-
