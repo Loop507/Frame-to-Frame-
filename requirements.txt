@@ -1,6 +1,5 @@
-streamlit>=1.32.0
-numpy>=1.24.0
-Pillow>=10.0.0
-opencv-python-headless>=4.7.0.72
-imageio[ffmpeg]>=2.31.0
-tqdm>=4.66.0
+streamlit
+numpy
+Pillow
+opencv-python-headless
+imageio
