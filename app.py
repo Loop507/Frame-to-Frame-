@@ -52,7 +52,7 @@ def corrupt_lines_effect(img1, img2, num_frames, intensity):
             x = random.randint(0, w - 10)
             y = random.randint(0, h - 1)
             line_length = random.randint(5, 15)
-            line_length = min(line_length, w - x)  # Correzione per non sforare i limiti
+            line_length = min(line_length, w - x)  # Evita out of bounds
             noise = np.random.randint(0, 255, (1, line_length, 3), dtype=np.uint8)
             frame[y:y+1, x:x+line_length] = noise
         frames.append(frame)
@@ -144,7 +144,7 @@ def film_grain_effect(img1, img2, num_frames, intensity):
         frames.append(frame)
     return frames
 
-# --- DIZIONARIO EFFETTI ---
+# --- EFFETTI DISPONIBILI ---
 
 effect_funcs = {
     "Fade": fade_effect,
@@ -161,19 +161,29 @@ effect_funcs = {
     "Film Grain": film_grain_effect
 }
 
+# --- FORMATI VIDEO ---
+video_formats = {
+    "1:1 (Square)": (512, 512),
+    "16:9 (Widescreen)": (854, 480),
+    "9:16 (Vertical)": (480, 854),
+}
+
 # --- INTERFACCIA UTENTE ---
 
 st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 uploaded_files = st.file_uploader("Carica almeno 2 immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 effect_choice = st.selectbox("Scegli l'effetto", list(effect_funcs.keys()))
+video_format = st.selectbox("Formato video", list(video_formats.keys()), index=0)
 duration = st.slider("Durata video (in secondi)", 1, 20, 5)
 intensity = st.slider("Intensità effetto", 1, 50, 15)
 video_btn = st.button("🎬 Genera Video")
 
 if video_btn and uploaded_files and len(uploaded_files) >= 2:
+    width, height = video_formats[video_format]
+
     images = [np.array(Image.open(file).convert("RGB")) for file in uploaded_files]
-    images = [cv2.resize(img, (512, 512)) for img in images]
+    images = [cv2.resize(img, (width, height)) for img in images]
 
     frames_per_transition = int(24 * duration / (len(images) - 1))
     all_frames = []
