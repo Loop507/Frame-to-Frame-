@@ -6,11 +6,10 @@ import imageio
 import os
 import tempfile
 import random
-from tqdm import tqdm
 
 st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator by Loop507", layout="wide")
 
-# --- EFFETTI ---
+# --- EFFETTI BASE ---
 def fade_effect(img1, img2, num_frames, intensity):
     img1 = img1.astype(np.float32)
     img2 = img2.astype(np.float32)
@@ -92,7 +91,7 @@ def zoom_random_effect(img1, img2, num_frames, intensity):
         zimg1 = cv2.warpAffine(img1, M, (w, h))
         zimg2 = cv2.warpAffine(img2, M, (w, h))
         frame = cv2.addWeighted(zimg1, 1 - alpha, zimg2, alpha, 0)
-        frames.append(frame.astype(np.uint8))
+        frames.append(frame)
     return frames
 
 def color_echo_effect(img1, img2, num_frames, intensity):
@@ -100,9 +99,7 @@ def color_echo_effect(img1, img2, num_frames, intensity):
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
         frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        r = frame.copy()
-        g = frame.copy()
-        b = frame.copy()
+        r, g, b = frame.copy(), frame.copy(), frame.copy()
         r[:, :, 1:] = 0
         g[:, :, [0, 2]] = 0
         b[:, :, :2] = 0
@@ -119,13 +116,11 @@ def particle_float_effect(img1, img2, num_frames, intensity):
         frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
         for x, y in particles:
             dx, dy = random.randint(-intensity, intensity), random.randint(-intensity, intensity)
-            nx = min(w - 1, max(0, x + dx))
-            ny = min(h - 1, max(0, y + dy))
-            cv2.circle(frame, (nx, ny), 2, (255, 255, 255), -1)
+            cv2.circle(frame, (min(w-1, max(0, x+dx)), min(h-1, max(0, y+dy))), 2, (255, 255, 255), -1)
         frames.append(frame)
     return frames
 
-# Preset combo effects without walrus operator
+# --- COMBO CREATIVE (preset combinati sicuri) ---
 def combo_effect_preset1(img1, img2, num_frames, intensity):
     args = (img1, img2, num_frames, intensity)
     return glitch_effect(*args) + pixelate_effect(*args)
@@ -136,9 +131,9 @@ def combo_effect_preset2(img1, img2, num_frames, intensity):
 
 def combo_effect_preset3(img1, img2, num_frames, intensity):
     args = (img1, img2, num_frames, intensity)
-    return morph_effect(*args) + color_echo_effect(*args) + particle_float_effect(*args) + zoom_random_effect(*args)
+    return zoom_random_effect(*args) + glitch_effect(*args) + pixelate_effect(*args) + color_echo_effect(*args)
 
-# --- EFFETTI DISPONIBILI ---
+# --- REGISTRAZIONE EFFETTI DISPONIBILI ---
 effect_funcs = {
     "Fade": fade_effect,
     "Morph": morph_effect,
@@ -155,7 +150,7 @@ effect_funcs = {
     "Combo Creative 3": combo_effect_preset3
 }
 
-# --- INTERFACCIA ---
+# --- INTERFACCIA STREAMLIT ---
 st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 uploaded_files = st.file_uploader("Carica almeno 2 (massimo 10) immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
@@ -171,4 +166,32 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         "16:9": (640, 360),
         "9:16": (360, 640)
     }
-   
+    target_size = format_dims[format_choice]
+
+    images = [np.array(Image.open(file).convert("RGB")) for file in uploaded_files]
+    images = [cv2.resize(img, target_size) for img in images]
+
+    frames_per_transition = int(24 * duration / (len(images) - 1))
+    all_frames = []
+    progress = st.progress(0.0)
+
+    for i in range(len(images) - 1):
+        img1, img2 = images[i], images[i + 1]
+        frames = effect_funcs[effect_choice](img1, img2, frames_per_transition, intensity)
+        all_frames.extend(frames)
+        progress.progress((i + 1) / (len(images) - 1))
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
+        filepath = tmpfile.name
+
+    writer = imageio.get_writer(filepath, fps=24)
+    for frame in all_frames:
+        writer.append_data(frame)
+    writer.close()
+
+    with open(filepath, "rb") as f:
+        st.download_button("📅 Scarica Video", f, file_name="output.mp4", mime="video/mp4")
+
+    st.success("✅ Video generato con successo!")
+else:
+    st.info("Carica almeno 2 (massimo 10) immagini e premi 'Genera Video'.")
