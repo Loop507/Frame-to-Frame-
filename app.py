@@ -150,13 +150,21 @@ st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 uploaded_files = st.file_uploader("Carica almeno 2 immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 effect_choice = st.selectbox("Scegli l'effetto", list(effect_funcs.keys()))
+format_choice = st.selectbox("Formato video", ["1:1", "16:9", "9:16"])
 duration = st.slider("Durata video (in secondi)", 1, 20, 5)
 intensity = st.slider("Intensità effetto", 1, 50, 15)
 video_btn = st.button("🎬 Genera Video")
 
 if video_btn and uploaded_files and len(uploaded_files) >= 2:
+    format_dims = {
+        "1:1": (512, 512),
+        "16:9": (640, 360),
+        "9:16": (360, 640)
+    }
+    target_size = format_dims[format_choice]
+
     images = [np.array(Image.open(file).convert("RGB")) for file in uploaded_files]
-    images = [cv2.resize(img, (512, 512)) for img in images]
+    images = [cv2.resize(img, target_size) for img in images]
 
     frames_per_transition = int(24 * duration / (len(images) - 1))
     all_frames = []
