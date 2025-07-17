@@ -6,6 +6,7 @@ import cv2
 from PIL import Image
 import random
 import traceback
+import imageio
 
 st.set_page_config(page_title="🎞️ Frame to Frame", layout="wide")
 
@@ -26,6 +27,22 @@ EFFECT_INTENSITIES = {
     "Medium": 0.6,
     "Hard": 1.0
 }
+
+# --- Effetti (riutilizza gli stessi definiti nel messaggio precedente) ---
+# Copia da linear_morph a pixel_morph (tutti gli effetti restano identici)
+# e incollali qui, poi continua con il codice sotto:
+
+EFFECTS_MAP = {
+    "Linear": linear_morph,
+    "Wave": wave_morph,
+    "Spiral": spiral_morph,
+    "Zoom": zoom_morph,
+    "Glitch": glitch_morph,
+    "Swap": swap_morph,
+    "Pixelate": pixel_morph,
+}
+
+EFFECTS_WITH_RANDOM = list(EFFECTS_MAP.keys())
 
 def load_image(uploaded_file):
     try:
@@ -65,154 +82,8 @@ def resize_to_target(img, target_size):
         st.error(f"Errore nel ridimensionamento: {str(e)}")
         return None
 
-def linear_morph(img1, img2, num_frames, intensity=1.0):
-    frames = []
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        smooth_alpha = alpha * intensity + (1 - intensity) * 0.5
-        morphed = (1 - smooth_alpha) * img1 + smooth_alpha * img2
-        frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
-    return frames
-
-def wave_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        x, y = np.meshgrid(np.arange(w), np.arange(h))
-        wave_intensity = 20 * intensity * np.sin(alpha * np.pi)
-        dx = wave_intensity * np.sin(2 * np.pi * y / h + alpha * 4 * np.pi)
-        dy = wave_intensity * np.cos(2 * np.pi * x / w + alpha * 4 * np.pi)
-        x_new = np.clip(x + dx, 0, w - 1)
-        y_new = np.clip(y + dy, 0, h - 1)
-        morphed = np.empty_like(img1)
-        for c in range(3):
-            chan = (1 - alpha) * img1[..., c] + alpha * img2[..., c]
-            morphed[..., c] = cv2.remap(chan, x_new.astype(np.float32), y_new.astype(np.float32), cv2.INTER_LINEAR)
-        frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
-    return frames
-
-def spiral_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    cx, cy = w // 2, h // 2
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        x, y = np.meshgrid(np.arange(w), np.arange(h))
-        dx = x - cx
-        dy = y - cy
-        radius = np.sqrt(dx**2 + dy**2)
-        angle = np.arctan2(dy, dx)
-        spiral_factor = alpha * 2 * np.pi * intensity
-        angle_new = angle + spiral_factor * (radius / max(w, h))
-        x_new = cx + radius * np.cos(angle_new)
-        y_new = cy + radius * np.sin(angle_new)
-        x_new = np.clip(x_new, 0, w - 1)
-        y_new = np.clip(y_new, 0, h - 1)
-        morphed = np.empty_like(img1)
-        for c in range(3):
-            chan = (1 - alpha) * img1[..., c] + alpha * img2[..., c]
-            morphed[..., c] = cv2.remap(chan, x_new.astype(np.float32), y_new.astype(np.float32), cv2.INTER_LINEAR)
-        frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
-    return frames
-
-def zoom_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    cx, cy = w // 2, h // 2
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        zoom_factor = 1 + (0.5 * intensity) * np.sin(alpha * np.pi)
-        M = cv2.getRotationMatrix2D((cx, cy), 0, zoom_factor)
-        img1_t = cv2.warpAffine(img1, M, (w, h))
-        img2_t = cv2.warpAffine(img2, M, (w, h))
-        morphed = (1 - alpha) * img1_t + alpha * img2_t
-        frames.append(np.clip(morphed, 0, 255).astype(np.uint8))
-    return frames
-
-def glitch_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        base = (1 - alpha) * img1 + alpha * img2
-        glitch_int = 0.3 * intensity * np.sin(alpha * np.pi * 4)
-        if abs(glitch_int) > 0.1:
-            result = base.copy()
-            shift = int(glitch_int * 20 * intensity)
-            if shift > 0:
-                result[:, shift:, 0] = base[:, :-shift, 0]
-            else:
-                result[:, :shift, 0] = base[:, -shift:, 0]
-            if shift > 0:
-                result[:, :-shift, 2] = base[:, shift:, 2]
-            else:
-                result[:, -shift:, 2] = base[:, :shift, 2]
-            num_lines = int(random.randint(1, 5) * intensity)
-            for _ in range(num_lines):
-                y = random.randint(0, h - 1)
-                thickness = random.randint(1, 3)
-                end_y = min(y + thickness, h)
-                line_shift = int(random.randint(-30, 30) * intensity)
-                if line_shift > 0:
-                    result[y:end_y, line_shift:] = base[y:end_y, :-line_shift]
-                elif line_shift < 0:
-                    result[y:end_y, :line_shift] = base[y:end_y, -line_shift:]
-            frames.append(np.clip(result, 0, 255).astype(np.uint8))
-        else:
-            frames.append(np.clip(base, 0, 255).astype(np.uint8))
-    return frames
-
-def swap_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    block_size = max(2, min(w, h) // int(8 * intensity + 2))
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        result = img1.copy()
-        num_blocks = int(alpha * intensity * (h // block_size) * (w // block_size))
-        blocks_swapped = 0
-        for y in range(0, h, block_size):
-            for x in range(0, w, block_size):
-                if blocks_swapped >= num_blocks:
-                    break
-                if random.random() < alpha * intensity:
-                    y_end = min(y + block_size, h)
-                    x_end = min(x + block_size, w)
-                    result[y:y_end, x:x_end] = img2[y:y_end, x:x_end]
-                    blocks_swapped += 1
-            if blocks_swapped >= num_blocks:
-                break
-        frames.append(result)
-    return frames
-
-def pixel_morph(img1, img2, num_frames, intensity=1.0):
-    h, w = img1.shape[:2]
-    frames = []
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1)
-        pixel_level = max(1, int(2 + 30 * intensity * np.sin(alpha * np.pi)))
-        base = (1 - alpha) * img1 + alpha * img2
-        temp_img = cv2.resize(base, (w // pixel_level, h // pixel_level), interpolation=cv2.INTER_NEAREST)
-        pixelated = cv2.resize(temp_img, (w, h), interpolation=cv2.INTER_NEAREST)
-        frames.append(np.clip(pixelated, 0, 255).astype(np.uint8))
-    return frames
-
-EFFECTS_MAP = {
-    "Linear": linear_morph,
-    "Wave": wave_morph,
-    "Spiral": spiral_morph,
-    "Zoom": zoom_morph,
-    "Glitch": glitch_morph,
-    "Swap": swap_morph,
-    "Pixelate": pixel_morph,
-}
-
-EFFECTS_WITH_RANDOM = list(EFFECTS_MAP.keys())
-
 def generate_morph(img1, img2, num_frames, effect, intensity):
     if effect == "Random":
-        # Scegli casualmente un effetto per questa transizione
         chosen_effect = random.choice(EFFECTS_WITH_RANDOM)
         morph_func = EFFECTS_MAP[chosen_effect]
     else:
@@ -224,16 +95,22 @@ def generate_morph(img1, img2, num_frames, effect, intensity):
         st.error(traceback.format_exc())
         return []
 
-def create_video(frames, fps, output_path):
+def create_video(frames, fps, output_path, progress_callback=None):
     if not frames:
         return False
     height, width = frames[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    for frame in frames:
+    for i, frame in enumerate(frames):
         video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        if progress_callback:
+            progress_callback(i + 1, len(frames))
     video.release()
     return True
+
+def create_preview_gif(frames, gif_path):
+    gif_frames = frames[:min(5, len(frames))]
+    imageio.mimsave(gif_path, gif_frames, fps=5)
 
 def main():
     st.sidebar.title("Impostazioni")
@@ -248,10 +125,8 @@ def main():
         custom_height = st.sidebar.number_input("Altezza video", min_value=100, max_value=4000, value=600)
 
     frames_per_transition = st.sidebar.slider("Frame per transizione", 1, 100, 30)
-
     effect_options = ["Random"] + list(EFFECTS_MAP.keys())
     effect = st.sidebar.selectbox("Effetto morphing", effect_options)
-
     intensity_label = st.sidebar.selectbox("Intensità effetto", list(EFFECT_INTENSITIES.keys()))
     intensity = EFFECT_INTENSITIES[intensity_label]
 
@@ -283,18 +158,28 @@ def main():
         images[i] = resized
 
     all_frames = []
+    progress_bar = st.progress(0, text="Generazione morphing...")
+
     for i in range(len(images) - 1):
         frames = generate_morph(images[i], images[i+1], frames_per_transition, effect, intensity)
         if not frames:
             st.error(f"Errore nella transizione {i+1}")
             return
         all_frames.extend(frames)
+        progress_bar.progress(int((i + 1) / (len(images) - 1) * 100), text="Generazione morphing...")
 
-    st.success("Morphing completato, generazione video in corso...")
+    st.success("Transizioni completate. Generazione video in corso...")
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         video_path = os.path.join(tmpdirname, "output.mp4")
-        if create_video(all_frames, fps, video_path):
+        gif_path = os.path.join(tmpdirname, "preview.gif")
+
+        def progress_callback(done, total):
+            progress_bar.progress(int(done / total * 100), text="Creazione video...")
+
+        if create_video(all_frames, fps, video_path, progress_callback):
+            create_preview_gif(all_frames, gif_path)
+            st.image(gif_path, caption="Anteprima", use_column_width=True)
             st.download_button("Scarica il video", video_path, file_name="morph_video.mp4", mime="video/mp4")
         else:
             st.error("Errore durante la creazione del video.")
