@@ -6,10 +6,11 @@ import imageio
 import os
 import tempfile
 import random
+from tqdm import tqdm
 
 st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator by Loop507", layout="wide")
 
-# --- EFFETTI BASE ---
+# --- EFFETTI ---
 def fade_effect(img1, img2, num_frames, intensity):
     img1 = img1.astype(np.float32)
     img2 = img2.astype(np.float32)
@@ -99,10 +100,8 @@ def color_echo_effect(img1, img2, num_frames, intensity):
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
         frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        r, g, b = frame.copy(), frame.copy(), frame.copy()
-        r[:, :, 1:] = 0
-        g[:, :, [0, 2]] = 0
-        b[:, :, :2] = 0
+        r = frame.copy(); g = frame.copy(); b = frame.copy()
+        r[:, :, 1:] = 0; g[:, :, [0, 2]] = 0; b[:, :, :2] = 0
         merged = cv2.addWeighted(r, 0.5, g, 0.5, 0)
         merged = cv2.addWeighted(merged, 0.5, b, 0.5, 0)
         frames.append(merged.astype(np.uint8))
@@ -120,20 +119,83 @@ def particle_float_effect(img1, img2, num_frames, intensity):
         frames.append(frame)
     return frames
 
-# --- COMBO CREATIVE (preset combinati sicuri) ---
+def film_look_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    for i, alpha in enumerate(np.linspace(0, 1, num_frames)):
+        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        noise = np.random.normal(0, intensity, (h, w, 3)).astype(np.uint8)
+        flicker = random.uniform(0.95, 1.05)
+        film = cv2.addWeighted(blend, flicker, noise, 0.1, 0)
+        frames.append(film)
+    return frames
+
+def vhs_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    for alpha in np.linspace(0, 1, num_frames):
+        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        for _ in range(intensity):
+            y = random.randint(0, h - 1)
+            frame[y:y+1] = np.roll(frame[y:y+1], random.randint(-5, 5), axis=1)
+        frame[:, :, 0] = cv2.equalizeHist(frame[:, :, 0])
+        frames.append(frame)
+    return frames
+
+def motion_blur_effect(img1, img2, num_frames, intensity):
+    kernel = np.zeros((intensity, intensity))
+    kernel[intensity//2, :] = np.ones(intensity)
+    kernel = kernel / intensity
+    frames = []
+    for alpha in np.linspace(0, 1, num_frames):
+        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        blurred = cv2.filter2D(blended, -1, kernel)
+        frames.append(blurred)
+    return frames
+
+def scanlines_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    for alpha in np.linspace(0, 1, num_frames):
+        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        for y in range(0, h, 2):
+            blended[y:y+1] = (blended[y:y+1] * 0.6).astype(np.uint8)
+        frames.append(blended)
+    return frames
+
+def burn_in_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (w//2, h//2), min(w, h)//3, 255, -1)
+    for alpha in np.linspace(0, 1, num_frames):
+        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        burn = cv2.applyColorMap(mask, cv2.COLORMAP_HOT)
+        final = cv2.addWeighted(blend, 1, burn, intensity/100.0, 0)
+        frames.append(final)
+    return frames
+
+def light_leaks_effect(img1, img2, num_frames, intensity):
+    h, w, _ = img1.shape
+    frames = []
+    overlay = np.zeros_like(img1)
+    cv2.circle(overlay, (w, 0), int(w / 1.5), (0, 255, 255), -1)
+    for alpha in np.linspace(0, 1, num_frames):
+        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        leak = cv2.addWeighted(blend, 1.0, overlay, intensity / 100.0, 0)
+        frames.append(leak)
+    return frames
+
 def combo_effect_preset1(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return glitch_effect(*args) + pixelate_effect(*args)
+    return glitch_effect(*args := (img1, img2, num_frames, intensity)) + pixelate_effect(*args)
 
 def combo_effect_preset2(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return wave_distort_effect(*args) + color_echo_effect(*args) + particle_float_effect(*args)
+    return wave_distort_effect(*args := (img1, img2, num_frames, intensity)) + color_echo_effect(*args) + particle_float_effect(*args)
 
 def combo_effect_preset3(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return zoom_random_effect(*args) + glitch_effect(*args) + pixelate_effect(*args) + color_echo_effect(*args)
+    return motion_blur_effect(*args := (img1, img2, num_frames, intensity)) + film_look_effect(*args) + zoom_random_effect(*args)
 
-# --- REGISTRAZIONE EFFETTI DISPONIBILI ---
+# --- EFFETTI DISPONIBILI ---
 effect_funcs = {
     "Fade": fade_effect,
     "Morph": morph_effect,
@@ -145,12 +207,18 @@ effect_funcs = {
     "Zoom Random": zoom_random_effect,
     "Color Echo": color_echo_effect,
     "Particle Float": particle_float_effect,
+    "Film Look": film_look_effect,
+    "VHS": vhs_effect,
+    "Motion Blur": motion_blur_effect,
+    "Scanlines": scanlines_effect,
+    "Burn-in": burn_in_effect,
+    "Light Leaks": light_leaks_effect,
     "Combo Creative 1": combo_effect_preset1,
     "Combo Creative 2": combo_effect_preset2,
     "Combo Creative 3": combo_effect_preset3
 }
 
-# --- INTERFACCIA STREAMLIT ---
+# --- INTERFACCIA ---
 st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 uploaded_files = st.file_uploader("Carica almeno 2 (massimo 10) immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
@@ -185,7 +253,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         filepath = tmpfile.name
 
     writer = imageio.get_writer(filepath, fps=24)
-    for frame in all_frames:
+    for frame in tqdm(all_frames):
         writer.append_data(frame)
     writer.close()
 
