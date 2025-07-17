@@ -6,29 +6,25 @@ import imageio
 import os
 import tempfile
 import random
+from tqdm import tqdm
 
-st.set_page_config(page_title="Frame-to-Frame FX Video Generator by Loop507", layout="wide")
+st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator by Loop507", layout="wide")
 
-# --- FUNZIONI DI EFFETTO ---
+# --- EFFETTI ---
 def fade_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.float32)
-    img2 = np.array(img2).astype(np.float32)
+    img1, img2 = np.array(img1).astype(np.float32), np.array(img2).astype(np.float32)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    return [(img1 * (1 - alpha) + img2 * alpha).astype(np.uint8)
-            for alpha in np.linspace(0, 1, num_frames)]
+    return [(img1 * (1 - alpha) + img2 * alpha).astype(np.uint8) for alpha in np.linspace(0, 1, num_frames)]
 
 def morph_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.uint8)
-    img2 = np.array(img2).astype(np.uint8)
+    img1, img2 = np.array(img1), np.array(img2)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    return [(cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)).astype(np.uint8)
-            for alpha in np.linspace(0, 1, num_frames)]
+    return [(cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)).astype(np.uint8) for alpha in np.linspace(0, 1, num_frames)]
 
 def glitch_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.uint8)
-    img2 = np.array(img2).astype(np.uint8)
+    img1, img2 = np.array(img1), np.array(img2)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
     h, w, _ = img1.shape
@@ -41,59 +37,53 @@ def glitch_effect(img1, img2, num_frames):
         frames.append(frame.astype(np.uint8))
     return frames
 
-def slide_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.uint8)
-    img2 = np.array(img2).astype(np.uint8)
+def pixel_block_effect(img1, img2, num_frames):
+    img1, img2 = np.array(img1), np.array(img2)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
     h, w, _ = img1.shape
     frames = []
-    for i in range(num_frames):
-        offset = int(w * i / num_frames)
-        frame = np.zeros_like(img1)
-        frame[:, :w - offset] = img1[:, offset:]
-        frame[:, w - offset:] = img2[:, :offset]
-        frames.append(frame)
+    for alpha in np.linspace(0, 1, num_frames):
+        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        for _ in range(30):
+            x, y = random.randint(0, w-8), random.randint(0, h-8)
+            blended[y:y+4, x:x+4] = np.random.randint(0, 255, (4, 4, 3), dtype=np.uint8)
+        frames.append(blended)
     return frames
 
-def invert_colors_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.uint8)
-    img2 = np.array(img2).astype(np.uint8)
+def line_noise_effect(img1, img2, num_frames):
+    img1, img2 = np.array(img1), np.array(img2)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    h, w, _ = img1.shape
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
-        inv_img1 = 255 - img1
-        frame = cv2.addWeighted(inv_img1, 1 - alpha, img2, alpha, 0)
-        frames.append(frame.astype(np.uint8))
+        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        for _ in range(10):
+            y = random.randint(0, h-1)
+            cv2.line(blended, (0, y), (w, y), (random.randint(0,255),)*3, 1)
+        frames.append(blended)
     return frames
 
 def color_echo_effect(img1, img2, num_frames):
-    img1 = np.array(img1).astype(np.float32)
-    img2 = np.array(img2).astype(np.float32)
+    img1, img2 = np.array(img1), np.array(img2)
     if img1.shape != img2.shape:
         img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    
     frames = []
-    echo_intensity = 0.6
-    prev_frame = img1.copy()
     for alpha in np.linspace(0, 1, num_frames):
-        base = img1 * (1 - alpha) + img2 * alpha
-        frame = base * (1 - echo_intensity) + prev_frame * echo_intensity
-        frame = np.clip(frame, 0, 255).astype(np.uint8)
-        frames.append(frame)
-        prev_frame = frame.astype(np.float32)
+        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        b, g, r = cv2.split(blend)
+        g = np.roll(g, 5, axis=1)
+        r = np.roll(r, -5, axis=0)
+        frames.append(cv2.merge([b, g, r]))
     return frames
 
 def random_effect(img1, img2, num_frames):
-    effect_list = [fade_effect, morph_effect, glitch_effect, slide_effect, invert_colors_effect, color_echo_effect]
-    effect = random.choice(effect_list)
-    return effect(img1, img2, num_frames)
+    effects = [fade_effect, morph_effect, glitch_effect, pixel_block_effect, line_noise_effect, color_echo_effect]
+    return random.choice(effects)(img1, img2, num_frames)
 
 # --- INTERFACCIA STREAMLIT ---
-st.markdown("""
-    <h1 style='font-size: 28px;'>Frame-to-Frame FX Video Generator <span style='font-size:14px; color: gray;'>by Loop507</span></h1>
-    """, unsafe_allow_html=True)
+st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -101,69 +91,55 @@ with col1:
 with col2:
     output_format = st.selectbox("Formato output", ["1:1", "9:16", "16:9"])
 
-num_frames = st.slider("Frame per transizione", 5, 60, 20)
-effect_choice = st.selectbox("Effetto", ["Fade", "Morph", "Glitch", "Slide", "Invert Colors", "Eco Colori", "Random"])
+duration = st.slider("Durata totale del video (secondi)", 1, 30, 10)
+effect_choice = st.selectbox("Effetto", ["Fade", "Morph", "Glitch", "Pixel", "Linee", "Eco Colori", "Random"])
 effect_strength = st.selectbox("Intensità Effetto", ["Soft", "Medio", "Hard"])
 
-# Durata video in secondi
-duration_sec = st.number_input("Durata totale video (secondi)", min_value=1, max_value=60, value=10, step=1)
-
 if uploaded_files and len(uploaded_files) >= 2:
-    images = [Image.open(file).convert("RGB") for file in uploaded_files]
+    if st.button("🎬 Genera Video"):
+        images = [Image.open(file).convert("RGB") for file in uploaded_files]
+        target_size = (512, 512) if output_format == "1:1" else (540, 960) if output_format == "9:16" else (960, 540)
+        images = [img.resize(target_size) for img in images]
 
-    if output_format == "1:1":
-        target_size = (512, 512)
-    elif output_format == "9:16":
-        target_size = (540, 960)
-    else:
-        target_size = (960, 540)
+        strength_map = {"Soft": 10, "Medio": 20, "Hard": 40}
+        frames_per_transition = strength_map[effect_strength]
 
-    images = [img.resize(target_size) for img in images]
+        total_transitions = len(images) - 1
+        total_frames = duration * 24
+        frames_per_transition = max(5, total_frames // total_transitions)
 
-    strength_map = {"Soft": 10, "Medio": 20, "Hard": 40}
-    n_frames_per_transition = strength_map[effect_strength]
-
-    # Calcolo fps per rispettare durata video totale
-    total_transitions = len(images) - 1
-    total_frames = total_transitions * n_frames_per_transition
-    fps = total_frames / duration_sec
-
-    # Bottone per generare video
-    if st.button("Genera Video"):
         all_frames = []
-        progress = st.progress(0)
+        progress = st.progress(0.0, text="Generazione video in corso...")
 
         for i in range(total_transitions):
-            img1, img2 = images[i], images[i + 1]
-
+            img1, img2 = images[i], images[i+1]
             if effect_choice == "Fade":
-                frames = fade_effect(img1, img2, n_frames_per_transition)
+                frames = fade_effect(img1, img2, frames_per_transition)
             elif effect_choice == "Morph":
-                frames = morph_effect(img1, img2, n_frames_per_transition)
+                frames = morph_effect(img1, img2, frames_per_transition)
             elif effect_choice == "Glitch":
-                frames = glitch_effect(img1, img2, n_frames_per_transition)
-            elif effect_choice == "Slide":
-                frames = slide_effect(img1, img2, n_frames_per_transition)
-            elif effect_choice == "Invert Colors":
-                frames = invert_colors_effect(img1, img2, n_frames_per_transition)
+                frames = glitch_effect(img1, img2, frames_per_transition)
+            elif effect_choice == "Pixel":
+                frames = pixel_block_effect(img1, img2, frames_per_transition)
+            elif effect_choice == "Linee":
+                frames = line_noise_effect(img1, img2, frames_per_transition)
             elif effect_choice == "Eco Colori":
-                frames = color_echo_effect(img1, img2, n_frames_per_transition)
+                frames = color_echo_effect(img1, img2, frames_per_transition)
             else:
-                frames = random_effect(img1, img2, n_frames_per_transition)
-
+                frames = random_effect(img1, img2, frames_per_transition)
             all_frames.extend(frames)
-            progress.progress((i + 1) / total_transitions)
+            progress.progress((i+1)/total_transitions)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
             filepath = tmpfile.name
 
-        writer = imageio.get_writer(filepath, fps=fps, codec="libx264")
-        for frame in all_frames:
+        writer = imageio.get_writer(filepath, fps=24, codec='libx264')
+        for frame in tqdm(all_frames):
             writer.append_data(frame)
         writer.close()
 
         st.success("✅ Video generato con successo!")
-        st.download_button("⬇️ Scarica Video", filepath, file_name="frame_to_frame_fx.mp4", mime="video/mp4")
-
+        with open(filepath, "rb") as f:
+            st.download_button("📥 Scarica Video", f, file_name="frame_to_frame_output.mp4")
 else:
     st.warning("Carica almeno due immagini per iniziare.")
