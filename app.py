@@ -101,7 +101,9 @@ def color_echo_effect(img1, img2, num_frames, intensity):
     for alpha in np.linspace(0, 1, num_frames):
         frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
         r = frame.copy(); g = frame.copy(); b = frame.copy()
-        r[:, :, 1:] = 0; g[:, :, [0, 2]] = 0; b[:, :, :2] = 0
+        r[:, :, 1:] = 0
+        g[:, :, [0, 2]] = 0
+        b[:, :, :2] = 0
         merged = cv2.addWeighted(r, 0.5, g, 0.5, 0)
         merged = cv2.addWeighted(merged, 0.5, b, 0.5, 0)
         frames.append(merged.astype(np.uint8))
@@ -115,7 +117,9 @@ def particle_float_effect(img1, img2, num_frames, intensity):
         frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
         for x, y in particles:
             dx, dy = random.randint(-intensity, intensity), random.randint(-intensity, intensity)
-            cv2.circle(frame, (min(w-1, max(0, x+dx)), min(h-1, max(0, y+dy))), 2, (255, 255, 255), -1)
+            nx = min(w - 1, max(0, x + dx))
+            ny = min(h - 1, max(0, y + dy))
+            cv2.circle(frame, (nx, ny), 2, (255, 255, 255), -1)
         frames.append(frame)
     return frames
 
@@ -155,45 +159,51 @@ def motion_blur_effect(img1, img2, num_frames, intensity):
 
 def scanlines_effect(img1, img2, num_frames, intensity):
     h, w, _ = img1.shape
+    lines_spacing = max(1, 10 - intensity // 5)
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
-        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for y in range(0, h, 2):
-            blended[y:y+1] = (blended[y:y+1] * 0.6).astype(np.uint8)
-        frames.append(blended)
+        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        for y in range(0, h, lines_spacing):
+            frame[y:y+1, :] = (frame[y:y+1, :] * 0.5).astype(np.uint8)
+        frames.append(frame)
     return frames
 
 def burn_in_effect(img1, img2, num_frames, intensity):
     h, w, _ = img1.shape
     frames = []
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(mask, (w//2, h//2), min(w, h)//3, 255, -1)
+    overlay = np.zeros_like(img1, dtype=np.uint8)
+    for i in range(0, h, 20):
+        cv2.line(overlay, (0, i), (w, i), (intensity*5, intensity*3, intensity*2), 1)
     for alpha in np.linspace(0, 1, num_frames):
-        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        burn = cv2.applyColorMap(mask, cv2.COLORMAP_HOT)
-        final = cv2.addWeighted(blend, 1, burn, intensity/100.0, 0)
-        frames.append(final)
+        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        burned = cv2.addWeighted(frame, 1, overlay, 0.2, 0)
+        frames.append(burned)
     return frames
 
 def light_leaks_effect(img1, img2, num_frames, intensity):
     h, w, _ = img1.shape
     frames = []
-    overlay = np.zeros_like(img1)
-    cv2.circle(overlay, (w, 0), int(w / 1.5), (0, 255, 255), -1)
     for alpha in np.linspace(0, 1, num_frames):
-        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        leak = cv2.addWeighted(blend, 1.0, overlay, intensity / 100.0, 0)
-        frames.append(leak)
+        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
+        leak = np.zeros_like(frame, dtype=np.uint8)
+        cv2.circle(leak, (random.randint(0, w), random.randint(0, h)), random.randint(w//4, w//2), 
+                   (intensity*5, intensity*3, intensity*2), -1)
+        leak = cv2.GaussianBlur(leak, (101,101), 0)
+        combined = cv2.addWeighted(frame, 1, leak, 0.3, 0)
+        frames.append(combined)
     return frames
 
 def combo_effect_preset1(img1, img2, num_frames, intensity):
-    return glitch_effect(*args := (img1, img2, num_frames, intensity)) + pixelate_effect(*args)
+    args = (img1, img2, num_frames, intensity)
+    return glitch_effect(*args) + pixelate_effect(*args)
 
 def combo_effect_preset2(img1, img2, num_frames, intensity):
-    return wave_distort_effect(*args := (img1, img2, num_frames, intensity)) + color_echo_effect(*args) + particle_float_effect(*args)
+    args = (img1, img2, num_frames, intensity)
+    return wave_distort_effect(*args) + color_echo_effect(*args) + particle_float_effect(*args)
 
 def combo_effect_preset3(img1, img2, num_frames, intensity):
-    return motion_blur_effect(*args := (img1, img2, num_frames, intensity)) + film_look_effect(*args) + zoom_random_effect(*args)
+    args = (img1, img2, num_frames, intensity)
+    return motion_blur_effect(*args) + film_look_effect(*args) + zoom_random_effect(*args)
 
 # --- EFFETTI DISPONIBILI ---
 effect_funcs = {
