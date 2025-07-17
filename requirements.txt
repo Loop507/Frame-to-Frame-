@@ -1,4 +1,8 @@
 streamlit
 numpy
-opencv-python-headless
 Pillow
+opencv-python-headless
+imageio
+imageio-ffmpeg
+tqdm
+
