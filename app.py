@@ -239,10 +239,11 @@ intensity = st.slider("Intensità effetto", 1, 50, 15)
 video_btn = st.button("🎬 Genera Video")
 
 if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
+    # CORREZIONE: Risoluzioni corrette
     format_dims = {
-        "1:1": (512, 512),
-        "16:9": (640, 360),
-        "9:16": (360, 640)
+        "1:1": (720, 720),      # Era 512x512
+        "16:9": (1280, 720),    # Era 640x360
+        "9:16": (720, 1280)     # Era 360x640
     }
     target_size = format_dims[format_choice]
 
