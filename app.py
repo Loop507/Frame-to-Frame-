@@ -3,274 +3,138 @@ import numpy as np
 import cv2
 from PIL import Image
 import imageio
-import os
 import tempfile
 import random
-from tqdm import tqdm
 
-st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator by Loop507", layout="wide")
+st.set_page_config(page_title="🎞️ RECURSIVE COLLAPSE: Ultimate Machine v3", layout="wide")
 
-# --- EFFETTI ---
-def fade_effect(img1, img2, num_frames, intensity):
-    img1 = img1.astype(np.float32)
-    img2 = img2.astype(np.float32)
-    return [(img1 * (1 - alpha) + img2 * alpha).astype(np.uint8)
-            for alpha in np.linspace(0, 1, num_frames)]
+# --- STRUMENTI DI BASE (LAYER) ---
 
-def morph_effect(img1, img2, num_frames, intensity):
-    return [(cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)).astype(np.uint8)
-            for alpha in np.linspace(0, 1, num_frames)]
+def apply_scanlines(img, intensity):
+    res = img.copy()
+    gap = max(2, 12 - (int(intensity) // 8))
+    res[::gap, :, :] = res[::gap, :, :] // 2
+    return res
 
-def glitch_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
+def apply_aberration(img, intensity):
+    shift = int(intensity // 6)
+    b, g, r = cv2.split(img)
+    b = np.roll(b, shift, axis=1)
+    r = np.roll(r, -shift, axis=1)
+    return cv2.merge([b, g, r])
+
+def apply_corruption(img, intensity):
+    res = img.copy()
+    h, w, _ = res.shape
+    for _ in range(int(intensity // 2)):
+        y = random.randint(0, h - 1)
+        line_w = random.randint(1, 4)
+        res[y:y+line_w, :] = np.roll(res[y:y+line_w, :], random.randint(-50, 50), axis=1)
+    return res
+
+# --- ALGORITMI DI TRANSIZIONE ---
+
+def kinetic_conveyor_effect(all_images, num_frames, intensity):
+    h, w, _ = all_images[0].shape
+    frames = []
+    num_strands = max(5, int(intensity))
+    strand_size = h // num_strands
+    speeds = [random.uniform(0.02, 0.15) for _ in range(num_strands)]
+    offsets = [random.uniform(0, len(all_images)) for _ in range(num_strands)]
+    
+    for f in range(num_frames):
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        noise_boost = 12.0 if random.random() > 0.96 else 1.0
+        for s in range(num_strands):
+            offsets[s] += speeds[s] * noise_boost
+            idx = int(offsets[s] % len(all_images))
+            nxt = (idx + 1) % len(all_images)
+            alpha = offsets[s] % 1
+            y_s, y_e = s*strand_size, (s+1)*strand_size if s < num_strands-1 else h
+            strip = cv2.addWeighted(all_images[idx][y_s:y_e, :], 1-alpha, all_images[nxt][y_s:y_e, :], alpha, 0)
+            frame[y_s:y_e, :] = strip
+        if intensity > 50: frame = apply_scanlines(frame, intensity)
+        frames.append(frame)
+    return frames
+
+def recursive_cut_effect(img1, img2, num_frames, intensity):
+    frames = []
+    curr = img1
+    i = 0
+    while i < num_frames:
+        dur = random.randint(max(1, 8-(int(intensity)//10)), max(3, 15-(int(intensity)//10)))
+        for _ in range(dur):
+            if i < num_frames: frames.append(curr); i += 1
+        curr = img2 if np.array_equal(curr, img1) else img1
+    return frames
+
+def combi_analog_collapse(img1, img2, num_frames, intensity):
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for _ in range(intensity):
-            y = random.randint(0, h - 2)
-            frame[y:y+2, :, :] = np.roll(frame[y:y+2, :, :], random.randint(-intensity, intensity), axis=1)
-        frames.append(frame.astype(np.uint8))
+        f = cv2.addWeighted(img1, 1-alpha, img2, alpha, 0)
+        f = apply_scanlines(f, intensity)
+        f = apply_aberration(f, intensity)
+        noise = np.random.randint(0, int(intensity), f.shape, dtype='uint8')
+        frames.append(cv2.add(f, noise))
     return frames
+
+def corrupted_lines_trans(img1, img2, num_frames, intensity):
+    return [apply_corruption(cv2.addWeighted(img1, 1-a, img2, a, 0), intensity) for a in np.linspace(0, 1, num_frames)]
 
 def pixelate_effect(img1, img2, num_frames, intensity):
     h, w, _ = img1.shape
     frames = []
     for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        scale = random.randint(4, 10)
-        small = cv2.resize(frame, (w//scale, h//scale), interpolation=cv2.INTER_LINEAR)
-        frame = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-        frames.append(frame)
+        f = cv2.addWeighted(img1, 1-alpha, img2, alpha, 0)
+        s = max(2, 30 - (int(intensity) // 4))
+        small = cv2.resize(f, (w//s, h//s), interpolation=cv2.INTER_LINEAR)
+        frames.append(cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST))
     return frames
 
-def corrupt_lines_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for _ in range(intensity):
-            x = random.randint(0, w - 15)
-            y = random.randint(0, h - 1)
-            width = random.randint(5, 15)
-            frame[y:y+1, x:x+width] = np.random.randint(0, 255, (1, width, 3), dtype=np.uint8)
-        frames.append(frame)
-    return frames
-
-def wave_distort_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        distorted = np.zeros_like(blend)
-        for y in range(h):
-            offset = int(intensity * np.sin(2 * np.pi * y / 50))
-            distorted[y] = np.roll(blend[y], offset, axis=0)
-        frames.append(distorted)
-    return frames
-
-def zoom_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for i, alpha in enumerate(np.linspace(0, 1, num_frames)):
-        zoom = 1 + (intensity / 100.0) * (i / num_frames)
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, 0, zoom)
-        zoomed_img1 = cv2.warpAffine(img1, M, (w, h))
-        zoomed_img2 = cv2.warpAffine(img2, M, (w, h))
-        frame = cv2.addWeighted(zoomed_img1, 1 - alpha, zoomed_img2, alpha, 0)
-        frames.append(frame.astype(np.uint8))
-    return frames
-
-def zoom_random_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for i, alpha in enumerate(np.linspace(0, 1, num_frames)):
-        zoom = random.uniform(1, 1 + intensity / 50.0)
-        cx = random.randint(w//4, 3*w//4)
-        cy = random.randint(h//4, 3*h//4)
-        M = cv2.getRotationMatrix2D((cx, cy), 0, zoom)
-        zimg1 = cv2.warpAffine(img1, M, (w, h))
-        zimg2 = cv2.warpAffine(img2, M, (w, h))
-        frame = cv2.addWeighted(zimg1, 1 - alpha, zimg2, alpha, 0)
-        frames.append(frame)
-    return frames
-
-def color_echo_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        r = frame.copy(); g = frame.copy(); b = frame.copy()
-        r[:, :, 1:] = 0
-        g[:, :, [0, 2]] = 0
-        b[:, :, :2] = 0
-        merged = cv2.addWeighted(r, 0.5, g, 0.5, 0)
-        merged = cv2.addWeighted(merged, 0.5, b, 0.5, 0)
-        frames.append(merged.astype(np.uint8))
-    return frames
-
-def particle_float_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    particles = [(random.randint(0, w), random.randint(0, h)) for _ in range(50)]
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for x, y in particles:
-            dx, dy = random.randint(-intensity, intensity), random.randint(-intensity, intensity)
-            nx = min(w - 1, max(0, x + dx))
-            ny = min(h - 1, max(0, y + dy))
-            cv2.circle(frame, (nx, ny), 2, (255, 255, 255), -1)
-        frames.append(frame)
-    return frames
-
-def film_look_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for i, alpha in enumerate(np.linspace(0, 1, num_frames)):
-        blend = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        noise = np.random.normal(0, intensity, (h, w, 3)).astype(np.uint8)
-        flicker = random.uniform(0.95, 1.05)
-        film = cv2.addWeighted(blend, flicker, noise, 0.1, 0)
-        frames.append(film)
-    return frames
-
-def vhs_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for _ in range(intensity):
-            y = random.randint(0, h - 1)
-            frame[y:y+1] = np.roll(frame[y:y+1], random.randint(-5, 5), axis=1)
-        frame[:, :, 0] = cv2.equalizeHist(frame[:, :, 0])
-        frames.append(frame)
-    return frames
-
-def motion_blur_effect(img1, img2, num_frames, intensity):
-    kernel = np.zeros((intensity, intensity))
-    kernel[intensity//2, :] = np.ones(intensity)
-    kernel = kernel / intensity
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        blurred = cv2.filter2D(blended, -1, kernel)
-        frames.append(blurred)
-    return frames
-
-def scanlines_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    lines_spacing = max(1, 10 - intensity // 5)
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        for y in range(0, h, lines_spacing):
-            frame[y:y+1, :] = (frame[y:y+1, :] * 0.5).astype(np.uint8)
-        frames.append(frame)
-    return frames
-
-def burn_in_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    overlay = np.zeros_like(img1, dtype=np.uint8)
-    for i in range(0, h, 20):
-        cv2.line(overlay, (0, i), (w, i), (intensity*5, intensity*3, intensity*2), 1)
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        burned = cv2.addWeighted(frame, 1, overlay, 0.2, 0)
-        frames.append(burned)
-    return frames
-
-def light_leaks_effect(img1, img2, num_frames, intensity):
-    h, w, _ = img1.shape
-    frames = []
-    for alpha in np.linspace(0, 1, num_frames):
-        frame = cv2.addWeighted(img1, 1 - alpha, img2, alpha, 0)
-        leak = np.zeros_like(frame, dtype=np.uint8)
-        cv2.circle(leak, (random.randint(0, w), random.randint(0, h)), random.randint(w//4, w//2), 
-                   (intensity*5, intensity*3, intensity*2), -1)
-        leak = cv2.GaussianBlur(leak, (101,101), 0)
-        combined = cv2.addWeighted(frame, 1, leak, 0.3, 0)
-        frames.append(combined)
-    return frames
-
-def combo_effect_preset1(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return glitch_effect(*args) + pixelate_effect(*args)
-
-def combo_effect_preset2(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return wave_distort_effect(*args) + color_echo_effect(*args) + particle_float_effect(*args)
-
-def combo_effect_preset3(img1, img2, num_frames, intensity):
-    args = (img1, img2, num_frames, intensity)
-    return motion_blur_effect(*args) + film_look_effect(*args) + zoom_random_effect(*args)
-
-# --- EFFETTI DISPONIBILI ---
+# --- CONFIGURAZIONE DIZIONARIO ---
 effect_funcs = {
-    "Fade": fade_effect,
-    "Morph": morph_effect,
-    "Glitch": glitch_effect,
-    "Pixelate": pixelate_effect,
-    "Corrupt Lines": corrupt_lines_effect,
-    "Wave Distort": wave_distort_effect,
-    "Zoom": zoom_effect,
-    "Zoom Random": zoom_random_effect,
-    "Color Echo": color_echo_effect,
-    "Particle Float": particle_float_effect,
-    "Film Look": film_look_effect,
-    "VHS": vhs_effect,
-    "Motion Blur": motion_blur_effect,
-    "Scanlines": scanlines_effect,
-    "Burn-in": burn_in_effect,
-    "Light Leaks": light_leaks_effect,
-    "Combo Creative 1": combo_effect_preset1,
-    "Combo Creative 2": combo_effect_preset2,
-    "Combo Creative 3": combo_effect_preset3
+    "🎞️ Kinetic Conveyor (Tutte le foto)": kinetic_conveyor_effect,
+    "✂️ Recursive Cut (A/B)": recursive_cut_effect,
+    "🚀 COMBI: Analog Collapse": combi_analog_collapse,
+    "📡 Corrupted Lines": corrupted_lines_trans,
+    "📺 Scanlines Only": lambda i1, i2, n, f: [apply_scanlines(cv2.addWeighted(i1, 1-a, i2, a, 0), f) for a in np.linspace(0, 1, n)],
+    "🌈 Glitch Aberration": lambda i1, i2, n, f: [apply_aberration(cv2.addWeighted(i1, 1-a, i2, a, 0), f) for a in np.linspace(0, 1, n)],
+    "👾 Pixelate": pixelate_effect,
+    "🌫️ Classic Fade": lambda i1, i2, n, f: [cv2.addWeighted(i1, 1-a, i2, a, 0).astype(np.uint8) for a in np.linspace(0, 1, n)]
 }
 
 # --- INTERFACCIA ---
-st.title("🎞️ Frame-to-Frame FX Video Generator by Loop507")
+st.title("🎞️ RECURSIVE COLLAPSE: Ultimate Machine")
+st.write("Versione Revisionata: Massima stabilità per Streamlit.")
 
-uploaded_files = st.file_uploader("Carica almeno 2 (massimo 10) immagini", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-effect_choice = st.selectbox("Scegli l'effetto", list(effect_funcs.keys()))
-format_choice = st.selectbox("Formato video", ["1:1", "16:9", "9:16"])
-duration = st.slider("Durata video (in secondi)", 1, 20, 5)
-intensity = st.slider("Intensità effetto", 1, 50, 15)
-video_btn = st.button("🎬 Genera Video")
+uploaded_files = st.file_uploader("Carica Artefatti (Max 50)", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
+effect_choice = st.selectbox("Algoritmo", list(effect_funcs.keys()))
+format_choice = st.selectbox("Formato", ["16:9", "1:1", "9:16"])
+duration = st.slider("Durata (secondi)", 1, 30, 10)
+intensity = st.slider("Intensità", 1, 100, 35)
 
-if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
-    # CORREZIONE: Risoluzioni corrette
-    format_dims = {
-        "1:1": (720, 720),      # Era 512x512
-        "16:9": (1280, 720),    # Era 640x360
-        "9:16": (720, 1280)     # Era 360x640
-    }
-    target_size = format_dims[format_choice]
+if st.button("🎬 GENERA") and uploaded_files and len(uploaded_files) >= 2:
+    if len(uploaded_files) > 50: uploaded_files = uploaded_files[:50]
+    
+    dims = {"1:1": (720, 720), "16:9": (1280, 720), "9:16": (720, 1280)}
+    target_size = dims[format_choice]
 
-    images = [np.array(Image.open(file).convert("RGB")) for file in uploaded_files]
-    images = [cv2.resize(img, target_size) for img in images]
+    with st.spinner("Processing immagini..."):
+        images = [np.array(Image.open(f).convert("RGB").resize(target_size, Image.Resampling.NEAREST)) for f in uploaded_files]
 
-    frames_per_transition = int(24 * duration / (len(images) - 1))
+    total_frames = 24 * duration
     all_frames = []
-    progress = st.progress(0.0)
 
-    for i in range(len(images) - 1):
-        img1, img2 = images[i], images[i + 1]
-        frames = effect_funcs[effect_choice](img1, img2, frames_per_transition, intensity)
-        all_frames.extend(frames)
-        progress.progress((i + 1) / (len(images) - 1))
+    if "Kinetic" in effect_choice:
+        all_frames = kinetic_conveyor_effect(images, total_frames, intensity)
+    else:
+        frames_per_trans = total_frames // (len(images) - 1)
+        for i in range(len(images) - 1):
+            res = effect_funcs[effect_choice](images[i], images[i+1], frames_per_trans, intensity)
+            all_frames.extend(res)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
-        filepath = tmpfile.name
-
-    writer = imageio.get_writer(filepath, fps=24)
-    for frame in tqdm(all_frames):
-        writer.append_data(frame)
-    writer.close()
-
-    with open(filepath, "rb") as f:
-        st.download_button("📅 Scarica Video", f, file_name="output.mp4", mime="video/mp4")
-
-    st.success("✅ Video generato con successo!")
-else:
-    st.info("Carica almeno 2 (massimo 10) immagini e premi 'Genera Video'.")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        imageio.mimwrite(tmp.name, all_frames, fps=24, quality=6)
+        st.video(tmp.name)
+        with open(tmp.name, "rb") as f:
+            st.download_button("💾 DOWNLOAD", f, file_name="collapse_final.mp4")
