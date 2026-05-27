@@ -1,6 +1,8 @@
-streamlit
-numpy
-opencv-python-headless
-Pillow
-imageio[ffmpeg]
-tqdm
+streamlit>=1.35.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+librosa>=0.10.0
+soundfile>=0.12.1
