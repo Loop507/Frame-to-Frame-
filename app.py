@@ -272,12 +272,16 @@ def generate_report(params: dict) -> str:
     now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
     music_line = ""
     if params.get("music_enabled") and params.get("bpm"):
+        mode_label = "Tutto il brano" if params.get("full_song_mode") else "Durata manuale"
+        audio_dur = f"{params['audio_duration']:.1f}s" if params.get("audio_duration") else "—"
         music_line = f"""
 🎵 AUDIO
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 File audio      : {params['music_name']}
 BPM rilevati    : {params['bpm']:.1f} BPM
 Beat interval   : {60 / params['bpm']:.3f} sec
+Durata brano    : {audio_dur}
+Modalità durata : {mode_label}
 Transizioni     : sincronizzate ai beat
 """
     else:
@@ -335,7 +339,7 @@ Python · OpenCV · NumPy · imageio · Streamlit
 # ─────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────
-for key in ["video_bytes", "report_text", "video_ready"]:
+for key in ["video_bytes", "audio_bytes", "audio_name", "report_text", "video_ready"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -360,13 +364,20 @@ with col2:
 
 col3, col4 = st.columns(2)
 with col3:
-    duration = st.slider("Durata video (secondi)", 1, 20, 5)
     intensity = st.slider("Intensità effetto", 1, 50, 15)
-with col4:
     use_music = st.toggle("🎵 Sincronizza musica ai beat", value=False)
     audio_file = None
     if use_music:
         audio_file = st.file_uploader("Carica brano (MP3 / WAV)", type=["mp3", "wav"])
+with col4:
+    duration_mode = st.radio(
+        "Durata video",
+        ["⏱️ Durata manuale", "🎵 Tutto il brano"],
+        disabled=(not use_music or audio_file is None),
+        help="'Tutto il brano' è disponibile solo con un brano caricato"
+    )
+    duration = st.slider("Durata manuale (secondi)", 1, 60, 5,
+                         disabled=(duration_mode == "🎵 Tutto il brano"))
 
 # ─────────────────────────────────────────────
 # GENERAZIONE
@@ -389,44 +400,74 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     num_transitions = len(images) - 1
     bpm_value = None
     music_name = None
+    tmp_audio_path = None
+    audio_duration_sec = None
+    full_song_mode = (duration_mode == "🎵 Tutto il brano" and use_music and audio_file is not None)
 
-    # ── Beat detection ──────────────────────────────
+    # ── Beat detection & audio save ─────────────────
     if use_music and audio_file is not None:
         try:
             import librosa
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio_file.name)[1]) as tmp_audio:
-                tmp_audio.write(audio_file.read())
+            audio_bytes_raw = audio_file.read()
+            suffix = os.path.splitext(audio_file.name)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_audio:
+                tmp_audio.write(audio_bytes_raw)
                 tmp_audio_path = tmp_audio.name
+
+            # Salva audio in session_state per download separato
+            st.session_state["audio_bytes"] = audio_bytes_raw
+            st.session_state["audio_name"] = audio_file.name
+
             y_audio, sr = librosa.load(tmp_audio_path, sr=None)
             tempo, beat_frames = librosa.beat.beat_track(y=y_audio, sr=sr)
             bpm_value = float(tempo)
             music_name = audio_file.name
-            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-            # Calcola frames per transizione basati su beat
+            audio_duration_sec = len(y_audio) / sr
+
             beat_interval_sec = 60.0 / bpm_value
             frames_per_transition = max(6, int(beat_interval_sec * FPS))
-            st.info(f"🎵 BPM rilevati: **{bpm_value:.1f}** — ogni transizione dura **{beat_interval_sec:.2f}s** ({frames_per_transition} frame)")
+            st.info(f"🎵 BPM: **{bpm_value:.1f}** — beat ogni **{beat_interval_sec:.2f}s** ({frames_per_transition} frame/transizione) — durata brano: **{audio_duration_sec:.1f}s**")
         except ImportError:
-            st.warning("⚠️ librosa non installato. Usa: pip install librosa. Procedo senza sync.")
+            st.warning("⚠️ librosa non installato. pip install librosa. Procedo senza sync.")
             frames_per_transition = int(FPS * duration / num_transitions)
+            full_song_mode = False
         except Exception as e:
             st.warning(f"⚠️ Errore analisi audio: {e}. Procedo senza sync.")
             frames_per_transition = int(FPS * duration / num_transitions)
+            full_song_mode = False
     else:
         frames_per_transition = int(FPS * duration / num_transitions)
 
-    # ── Generazione frame ───────────────────────────
+    # ── Calcola quante transizioni servono ──────────
+    if full_song_mode and audio_duration_sec:
+        total_video_frames_needed = int(audio_duration_sec * FPS)
+        total_transitions_needed = max(num_transitions, int(np.ceil(total_video_frames_needed / frames_per_transition)))
+    else:
+        total_transitions_needed = num_transitions
+
+    # ── Generazione frame (con ciclo immagini se full_song) ──
     all_frames = []
     progress = st.progress(0.0)
     status = st.empty()
 
-    for i in range(num_transitions):
-        status.text(f"Elaborazione transizione {i+1}/{num_transitions}...")
+    for i in range(total_transitions_needed):
+        idx1 = i % len(images)
+        idx2 = (i + 1) % len(images)
+        status.text(f"Elaborazione transizione {i+1}/{total_transitions_needed}...")
         frames = effect_funcs[effect_choice](
-            images[i], images[i + 1], frames_per_transition, intensity, easing_choice
+            images[idx1], images[idx2], frames_per_transition, intensity, easing_choice
         )
         all_frames.extend(frames)
-        progress.progress((i + 1) / num_transitions)
+        progress.progress((i + 1) / total_transitions_needed)
+
+        # Stop se in modalità full_song e abbiamo abbastanza frame
+        if full_song_mode and audio_duration_sec:
+            if len(all_frames) >= int(audio_duration_sec * FPS):
+                break
+
+    # Tronca esattamente alla durata del brano se full_song
+    if full_song_mode and audio_duration_sec:
+        all_frames = all_frames[:int(audio_duration_sec * FPS)]
 
     status.text("Scrittura video...")
 
@@ -441,7 +482,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
 
     # ── Mux audio se presente ───────────────────────
     final_video_path = video_path
-    if use_music and audio_file is not None and bpm_value is not None:
+    if use_music and tmp_audio_path and os.path.exists(tmp_audio_path):
         try:
             import subprocess
             muxed_path = video_path.replace(".mp4", "_audio.mp4")
@@ -459,7 +500,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
                 final_video_path = muxed_path
                 status.text("✅ Audio aggiunto al video!")
             else:
-                st.warning("⚠️ ffmpeg non disponibile o errore nel mux audio. Video senza audio.")
+                st.warning("⚠️ ffmpeg: errore nel mux audio. Video senza audio.")
         except Exception as e:
             st.warning(f"⚠️ Impossibile aggiungere audio: {e}")
 
@@ -481,11 +522,13 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         "fps": FPS,
         "total_frames": total_frames,
         "num_images": len(images),
-        "num_transitions": num_transitions,
+        "num_transitions": total_transitions_needed,
         "intensity": intensity,
         "music_enabled": use_music and audio_file is not None,
         "bpm": bpm_value,
         "music_name": music_name,
+        "full_song_mode": full_song_mode,
+        "audio_duration": audio_duration_sec,
     }
     st.session_state["report_text"] = generate_report(report_params)
     st.session_state["video_ready"] = True
@@ -503,9 +546,10 @@ elif video_btn:
 # ─────────────────────────────────────────────
 if st.session_state.get("video_ready"):
     st.divider()
-    dl_col1, dl_col2 = st.columns(2)
+    has_audio = st.session_state.get("audio_bytes") is not None
+    dl_cols = st.columns(3 if has_audio else 2)
 
-    with dl_col1:
+    with dl_cols[0]:
         st.download_button(
             label="📥 Scarica Video (.mp4)",
             data=st.session_state["video_bytes"],
@@ -514,7 +558,7 @@ if st.session_state.get("video_ready"):
             use_container_width=True,
         )
 
-    with dl_col2:
+    with dl_cols[1]:
         st.download_button(
             label="📄 Scarica Report (.txt)",
             data=st.session_state["report_text"],
@@ -522,6 +566,17 @@ if st.session_state.get("video_ready"):
             mime="text/plain",
             use_container_width=True,
         )
+
+    if has_audio:
+        audio_ext = os.path.splitext(st.session_state["audio_name"])[1]
+        with dl_cols[2]:
+            st.download_button(
+                label=f"🎵 Scarica Audio ({audio_ext})",
+                data=st.session_state["audio_bytes"],
+                file_name=st.session_state["audio_name"],
+                mime="audio/mpeg" if audio_ext == ".mp3" else "audio/wav",
+                use_container_width=True,
+            )
 
     with st.expander("👁️ Anteprima report"):
         st.code(st.session_state["report_text"], language=None)
