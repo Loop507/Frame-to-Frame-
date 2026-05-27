@@ -420,7 +420,8 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
 
             y_audio, sr = librosa.load(tmp_audio_path, sr=None)
             tempo, beat_frames = librosa.beat.beat_track(y=y_audio, sr=sr)
-            bpm_value = float(tempo)
+            # librosa >= 0.10 restituisce array, versioni precedenti scalare
+            bpm_value = float(np.atleast_1d(tempo)[0])
             music_name = audio_file.name
             audio_duration_sec = len(y_audio) / sr
 
