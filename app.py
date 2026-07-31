@@ -74,13 +74,19 @@ def corrupt_lines_effect(img1, img2, num_frames, intensity, easing):
 
 def wave_distort_effect(img1, img2, num_frames, intensity, easing):
     h, w, _ = img1.shape
+    # L'offset dipende solo dalla riga (periodo 50), quindi molte righe condividono
+    # lo stesso valore intero: le raggruppiamo e ruotiamo insieme in un solo colpo
+    # invece di un roll per riga (era il vero collo di bottiglia) o un gather pixel-per-pixel
+    # (misurato più lento del loop originale: il gather non vettorizza bene su grandi indici).
+    y_idx = np.arange(h)
+    offsets = (intensity * np.sin(2 * np.pi * y_idx / 50)).astype(np.int64)
+    groups = [(int(v), np.where(offsets == v)[0]) for v in np.unique(offsets)]
     frames = []
     for a in smooth_alpha(num_frames, easing):
         blend = cv2.addWeighted(img1, 1 - a, img2, a, 0)
-        distorted = np.zeros_like(blend)
-        for y in range(h):
-            offset = int(intensity * np.sin(2 * np.pi * y / 50))
-            distorted[y] = np.roll(blend[y], offset, axis=0)
+        distorted = np.empty_like(blend)
+        for v, rows in groups:
+            distorted[rows] = np.roll(blend[rows], v, axis=1)
         frames.append(distorted)
     return frames
 
@@ -238,16 +244,23 @@ def burn_in_effect(img1, img2, num_frames, intensity, easing):
 
 def light_leaks_effect(img1, img2, num_frames, intensity, easing):
     h, w, _ = img1.shape
+    # Blur a risoluzione ridotta: il glow non ha bisogno di dettaglio,
+    # quindi disegniamo il cerchio a 1/4 di risoluzione, sfochiamo lì (molto più economico)
+    # e poi ingrandiamo — risultato visivo pressoché identico al blur 101x101 a piena res.
+    small_w, small_h = max(1, w // 4), max(1, h // 4)
     frames = []
     for a in smooth_alpha(num_frames, easing):
         frame = cv2.addWeighted(img1, 1 - a, img2, a, 0)
-        leak = np.zeros_like(frame, dtype=np.uint8)
-        cv2.circle(leak, (random.randint(0, w), random.randint(0, h)),
-                   random.randint(w // 4, w // 2),
+        leak_small = np.zeros((small_h, small_w, 3), dtype=np.uint8)
+        cv2.circle(leak_small,
+                   (random.randint(0, small_w), random.randint(0, small_h)),
+                   random.randint(small_w // 4, small_w // 2) or 1,
                    (intensity * 5, intensity * 3, intensity * 2), -1)
-        leak = cv2.GaussianBlur(leak, (101, 101), 0)
+        leak_small = cv2.GaussianBlur(leak_small, (25, 25), 0)
+        leak = cv2.resize(leak_small, (w, h), interpolation=cv2.INTER_LINEAR)
         frames.append(cv2.addWeighted(frame, 1, leak, 0.3, 0))
     return frames
+
 
 def combo_effect_preset1(img1, img2, num_frames, intensity, easing):
     half = num_frames // 2
@@ -391,6 +404,8 @@ Transizioni     : agganciate ai beat reali rilevati (non a un intervallo medio f
     extra_line = ""
     if params.get("loop_mode") == "ping_pong":
         extra_line += "Loop            : ping-pong (avanti/indietro)\n"
+    if params.get("ffmpeg_preset"):
+        extra_line += f"Preset encoding : {params['ffmpeg_preset']}\n"
     if params.get("mixed_effects"):
         extra_line += f"Sequenza mista  : {', '.join(params['mixed_effects'])}\n"
 
@@ -491,6 +506,13 @@ with col4:
         horizontal=True,
     )
     loop_mode = "ping_pong" if "Ping-pong" in loop_mode_label else "cyclic"
+    speed_label = st.radio(
+        "Priorità render finale",
+        ["⚖️ Bilanciato", "⚡ Velocità (file leggermente più pesante)", "🎯 Qualità (più lento)"],
+        horizontal=True,
+    )
+    ffmpeg_preset = {"⚖️ Bilanciato": "medium", "⚡ Velocità (file leggermente più pesante)": "veryfast",
+                      "🎯 Qualità (più lento)": "slow"}[speed_label]
 
 # ─────────────────────────────────────────────
 # ANTEPRIMA RAPIDA
@@ -509,7 +531,8 @@ if preview_btn:
             eff_name = pick_effect_for_transition(effect_choice, rnd_preview)
             prev_frames = effect_funcs[eff_name](im1, im2, 24, intensity, easing_choice)
             prev_path = os.path.join(tempfile.gettempdir(), "ftf_preview.mp4")
-            writer_p = imageio.get_writer(prev_path, fps=12, codec="libx264", quality=6)
+            writer_p = imageio.get_writer(prev_path, fps=12, codec="libx264", quality=6,
+                                          output_params=["-preset", "ultrafast"])
             for fr in prev_frames:
                 writer_p.append_data(fr)
             writer_p.close()
@@ -614,7 +637,8 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
         video_path = tmpfile.name
 
-    writer = imageio.get_writer(video_path, fps=FPS, codec="libx264", quality=8)
+    writer = imageio.get_writer(video_path, fps=FPS, codec="libx264", quality=8,
+                                output_params=["-preset", ffmpeg_preset])
     progress = st.progress(0.0)
     status = st.empty()
     rnd = random.Random()
@@ -696,6 +720,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         "audio_duration": audio_duration_sec,
         "n_beats_detected": n_beats_detected,
         "loop_mode": loop_mode,
+        "ffmpeg_preset": ffmpeg_preset,
         "mixed_effects": sorted(set(mixed_effects_used)) if mixed_effects_used else None,
     }
     st.session_state["report_text"] = generate_report(report_params)
