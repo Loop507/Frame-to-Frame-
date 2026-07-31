@@ -109,6 +109,51 @@ def zoom_random_effect(img1, img2, num_frames, intensity, easing):
         frames.append(cv2.addWeighted(z1, 1 - a, z2, a, 0))
     return frames
 
+def wipe_effect(img1, img2, num_frames, intensity, easing):
+    """Wipe direzionale orizzontale (sinistra -> destra) con bordo sfumato."""
+    h, w, _ = img1.shape
+    feather = max(4, int(intensity))
+    xs = np.arange(w)
+    frames = []
+    for a in smooth_alpha(num_frames, easing):
+        edge = -feather + a * (w + feather)
+        alpha_row = np.clip((edge - xs) / feather + 1, 0, 1)
+        alpha_map = np.repeat(alpha_row[np.newaxis, :], h, axis=0)[:, :, np.newaxis]
+        frame = img1.astype(np.float32) * (1 - alpha_map) + img2.astype(np.float32) * alpha_map
+        frames.append(frame.astype(np.uint8))
+    return frames
+
+def diagonal_wipe_effect(img1, img2, num_frames, intensity, easing):
+    """Wipe diagonale (angolo in alto a sinistra -> basso a destra) con bordo sfumato."""
+    h, w, _ = img1.shape
+    feather = max(8, int(intensity) * 2)
+    yy, xx = np.mgrid[0:h, 0:w]
+    diag = xx + yy
+    max_diag = w + h
+    frames = []
+    for a in smooth_alpha(num_frames, easing):
+        edge = -feather + a * (max_diag + feather)
+        alpha_map = np.clip((edge - diag) / feather + 1, 0, 1)[:, :, np.newaxis]
+        frame = img1.astype(np.float32) * (1 - alpha_map) + img2.astype(np.float32) * alpha_map
+        frames.append(frame.astype(np.uint8))
+    return frames
+
+def iris_effect(img1, img2, num_frames, intensity, easing):
+    """Iris circolare che si espande dal centro con bordo sfumato."""
+    h, w, _ = img1.shape
+    cy, cx = h / 2.0, w / 2.0
+    feather = max(4, int(intensity))
+    yy, xx = np.mgrid[0:h, 0:w]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    max_r = float(np.sqrt(cx ** 2 + cy ** 2))
+    frames = []
+    for a in smooth_alpha(num_frames, easing):
+        radius = -feather + a * (max_r + feather)
+        alpha_map = np.clip((radius - dist) / feather + 1, 0, 1)[:, :, np.newaxis]
+        frame = img1.astype(np.float32) * (1 - alpha_map) + img2.astype(np.float32) * alpha_map
+        frames.append(frame.astype(np.uint8))
+    return frames
+
 def color_echo_effect(img1, img2, num_frames, intensity, easing):
     frames = []
     for a in smooth_alpha(num_frames, easing):
@@ -140,9 +185,11 @@ def film_look_effect(img1, img2, num_frames, intensity, easing):
     frames = []
     for a in smooth_alpha(num_frames, easing):
         blend = cv2.addWeighted(img1, 1 - a, img2, a, 0)
-        noise = np.random.normal(0, intensity, (h, w, 3)).astype(np.uint8)
+        noise = np.clip(np.random.normal(128, intensity, (h, w, 3)), 0, 255).astype(np.uint8)
         flicker = random.uniform(0.95, 1.05)
-        frames.append(cv2.addWeighted(blend, flicker, noise, 0.1, 0))
+        # noise centrato su 128: sottraiamo l'offset per ottenere grana simmetrica reale
+        blended = cv2.addWeighted(blend, flicker, noise, 0.12, -128 * 0.12)
+        frames.append(blended)
     return frames
 
 def vhs_effect(img1, img2, num_frames, intensity, easing):
@@ -230,6 +277,9 @@ effect_funcs = {
     "Wave Distort": wave_distort_effect,
     "Zoom": zoom_effect,
     "Zoom Random": zoom_random_effect,
+    "Wipe Direzionale": wipe_effect,
+    "Wipe Diagonale": diagonal_wipe_effect,
+    "Iris Circolare": iris_effect,
     "Color Echo": color_echo_effect,
     "Particle Float": particle_float_effect,
     "Film Look": film_look_effect,
@@ -252,6 +302,9 @@ effect_descriptions = {
     "Wave Distort": "Distorsione ondulata sinusoidale delle righe orizzontali.",
     "Zoom": "Zoom progressivo dal centro durante la transizione.",
     "Zoom Random": "Zoom da punto focale casuale per un effetto caotico.",
+    "Wipe Direzionale": "Spazzata orizzontale sinistra→destra con bordo sfumato.",
+    "Wipe Diagonale": "Spazzata diagonale angolo alto-sx → basso-dx con bordo sfumato.",
+    "Iris Circolare": "Apertura circolare dal centro verso i bordi, stile iris cinema.",
     "Color Echo": "Separazione e fusione dei canali RGB per aloni cromatici.",
     "Particle Float": "Particelle bianche fluttuanti sopra il blend.",
     "Film Look": "Grana cinematografica con flickering di esposizione.",
@@ -266,6 +319,53 @@ effect_descriptions = {
 }
 
 # ─────────────────────────────────────────────
+# UTILITY: CROP-TO-FILL (niente più immagini schiacciate)
+# ─────────────────────────────────────────────
+def resize_crop_fill(img, target_w, target_h):
+    """Ritaglia al centro per rispettare l'aspect ratio del formato scelto,
+    poi ridimensiona. Evita la distorsione del vecchio cv2.resize diretto."""
+    h, w = img.shape[:2]
+    target_ratio = target_w / target_h
+    src_ratio = w / h
+    if src_ratio > target_ratio:
+        new_w = max(1, int(round(h * target_ratio)))
+        x0 = (w - new_w) // 2
+        img = img[:, x0:x0 + new_w]
+    else:
+        new_h = max(1, int(round(w / target_ratio)))
+        y0 = (h - new_h) // 2
+        img = img[y0:y0 + new_h, :]
+    return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+# ─────────────────────────────────────────────
+# UTILITY: SEQUENZA IMMAGINI (ciclica o ping-pong)
+# ─────────────────────────────────────────────
+def build_image_sequence(n_images, loop_mode):
+    """Ritorna la lista ordinata degli indici immagine da percorrere.
+    'ciclico': 0,1,2,...,n-1,0,1,2,...
+    'ping_pong': 0,1,2,...,n-1,n-2,...,1,0,1,2,..."""
+    if loop_mode == "ping_pong" and n_images > 2:
+        return list(range(n_images)) + list(range(n_images - 2, 0, -1))
+    return list(range(n_images))
+
+def get_pair_indices(i, sequence):
+    seq_len = len(sequence)
+    idx1 = sequence[i % seq_len]
+    idx2 = sequence[(i + 1) % seq_len]
+    return idx1, idx2
+
+# ─────────────────────────────────────────────
+# MODALITA' MISTA (effetto random per transizione)
+# ─────────────────────────────────────────────
+MIXED_LABEL = "🎲 Sequenza mista (random per transizione)"
+MIXED_POOL = [k for k in effect_funcs.keys() if not k.startswith("Combo")]
+
+def pick_effect_for_transition(effect_choice, rnd):
+    if effect_choice == MIXED_LABEL:
+        return rnd.choice(MIXED_POOL)
+    return effect_choice
+
+# ─────────────────────────────────────────────
 # REPORT TEMPLATE
 # ─────────────────────────────────────────────
 def generate_report(params: dict) -> str:
@@ -274,18 +374,25 @@ def generate_report(params: dict) -> str:
     if params.get("music_enabled") and params.get("bpm"):
         mode_label = "Tutto il brano" if params.get("full_song_mode") else "Durata manuale"
         audio_dur = f"{params['audio_duration']:.1f}s" if params.get("audio_duration") else "—"
+        n_beats = params.get("n_beats_detected")
+        beats_line = f"Beat rilevati   : {n_beats}\n" if n_beats else ""
         music_line = f"""
 🎵 AUDIO
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 File audio      : {params['music_name']}
-BPM rilevati    : {params['bpm']:.1f} BPM
-Beat interval   : {60 / params['bpm']:.3f} sec
-Durata brano    : {audio_dur}
+BPM medio       : {params['bpm']:.1f} BPM
+{beats_line}Durata brano    : {audio_dur}
 Modalità durata : {mode_label}
-Transizioni     : sincronizzate ai beat
+Transizioni     : agganciate ai beat reali rilevati (non a un intervallo medio fisso)
 """
     else:
         music_line = "\n🔇 Nessun audio aggiunto al video.\n"
+
+    extra_line = ""
+    if params.get("loop_mode") == "ping_pong":
+        extra_line += "Loop            : ping-pong (avanti/indietro)\n"
+    if params.get("mixed_effects"):
+        extra_line += f"Sequenza mista  : {', '.join(params['mixed_effects'])}\n"
 
     report = f"""
 ╔══════════════════════════════════════════╗
@@ -307,11 +414,11 @@ Frame totali    : {params['total_frames']}
 Immagini usate  : {params['num_images']}
 Transizioni     : {params['num_transitions']}
 Intensità       : {params['intensity']} / 50
-{music_line}
+{extra_line}{music_line}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📝 DESCRIZIONE EFFETTO
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{effect_descriptions.get(params['effect'], 'Effetto personalizzato.')}
+{effect_descriptions.get(params['effect'], 'Effetto random diverso per ogni transizione (sequenza mista).')}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📣 CAPTION SUGGERITA PER SOCIAL / YOUTUBE
@@ -322,7 +429,7 @@ Creato con Frame-to-Frame FX by Loop507
 Effetto: {params['effect']} ({params['easing']} easing)
 {f"🎵 Beat-sync @ {params['bpm']:.1f} BPM — {params['music_name']}" if params.get('music_enabled') and params.get('bpm') else ""}
 
-#VideoArt #FrameToFrame #Loop507 #VisualFX #{params['effect'].replace(' ','')} #TransitionFX #Reels #Shorts
+#VideoArt #FrameToFrame #Loop507 #VisualFX #{"SequenzaMista" if params['effect'] == MIXED_LABEL else params['effect'].replace(' ','')} #TransitionFX #Reels #Shorts
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🛠️  STACK TECNICO
@@ -358,7 +465,7 @@ with col1:
     )
 
 with col2:
-    effect_choice = st.selectbox("Effetto", list(effect_funcs.keys()))
+    effect_choice = st.selectbox("Effetto", list(effect_funcs.keys()) + [MIXED_LABEL])
     easing_choice = st.selectbox("Curva easing", ["smootherstep", "smoothstep", "sinusoidal", "linear"])
     format_choice = st.selectbox("Formato video", ["1:1", "16:9", "9:16"])
 
@@ -378,6 +485,36 @@ with col4:
     )
     duration = st.slider("Durata manuale (secondi)", 1, 60, 5,
                          disabled=(duration_mode == "🎵 Tutto il brano"))
+    loop_mode_label = st.radio(
+        "Loop tra immagini (quando servono più transizioni delle immagini caricate)",
+        ["🔁 Ciclico", "🏓 Ping-pong (avanti/indietro)"],
+        horizontal=True,
+    )
+    loop_mode = "ping_pong" if "Ping-pong" in loop_mode_label else "cyclic"
+
+# ─────────────────────────────────────────────
+# ANTEPRIMA RAPIDA
+# ─────────────────────────────────────────────
+preview_btn = st.button("🔍 Anteprima rapida (prime 2 immagini, bassa risoluzione)")
+
+if preview_btn:
+    if not uploaded_files or len(uploaded_files) < 2:
+        st.warning("⚠️ Carica almeno 2 immagini per l'anteprima.")
+    else:
+        with st.spinner("Genero anteprima..."):
+            prev_size = (320, 320) if format_choice == "1:1" else ((480, 270) if format_choice == "16:9" else (270, 480))
+            im1 = resize_crop_fill(np.array(Image.open(uploaded_files[0]).convert("RGB")), *prev_size)
+            im2 = resize_crop_fill(np.array(Image.open(uploaded_files[1]).convert("RGB")), *prev_size)
+            rnd_preview = random.Random()
+            eff_name = pick_effect_for_transition(effect_choice, rnd_preview)
+            prev_frames = effect_funcs[eff_name](im1, im2, 24, intensity, easing_choice)
+            prev_path = os.path.join(tempfile.gettempdir(), "ftf_preview.mp4")
+            writer_p = imageio.get_writer(prev_path, fps=12, codec="libx264", quality=6)
+            for fr in prev_frames:
+                writer_p.append_data(fr)
+            writer_p.close()
+            st.caption(f"Effetto usato: **{eff_name}**")
+            st.video(prev_path)
 
 # ─────────────────────────────────────────────
 # GENERAZIONE
@@ -395,16 +532,19 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     FPS = 24
 
     images = [np.array(Image.open(f).convert("RGB")) for f in uploaded_files]
-    images = [cv2.resize(img, target_size) for img in images]
+    images = [resize_crop_fill(img, *target_size) for img in images]
+    image_sequence = build_image_sequence(len(images), loop_mode)
 
     num_transitions = len(images) - 1
     bpm_value = None
     music_name = None
     tmp_audio_path = None
     audio_duration_sec = None
+    n_beats_detected = None
+    beat_intervals_sec = None
     full_song_mode = (duration_mode == "🎵 Tutto il brano" and use_music and audio_file is not None)
 
-    # ── Beat detection & audio save ─────────────────
+    # ── Beat detection reale & audio save ───────────
     if use_music and audio_file is not None:
         try:
             import librosa
@@ -425,61 +565,85 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
             music_name = audio_file.name
             audio_duration_sec = len(y_audio) / sr
 
-            beat_interval_sec = 60.0 / bpm_value
-            frames_per_transition = max(6, int(beat_interval_sec * FPS))
-            st.info(f"🎵 BPM: **{bpm_value:.1f}** — beat ogni **{beat_interval_sec:.2f}s** ({frames_per_transition} frame/transizione) — durata brano: **{audio_duration_sec:.1f}s**")
+            # Usiamo i beat REALI rilevati, non solo il BPM medio
+            beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+            n_beats_detected = len(beat_times)
+            if len(beat_times) == 0 or beat_times[0] > 0.05:
+                beat_times = np.insert(beat_times, 0, 0.0)
+            if beat_times[-1] < audio_duration_sec - 0.05:
+                beat_times = np.append(beat_times, audio_duration_sec)
+            beat_intervals_sec = np.diff(beat_times)
+            beat_intervals_sec = beat_intervals_sec[beat_intervals_sec > 0.05]
+            if len(beat_intervals_sec) == 0:
+                raise ValueError("nessun intervallo di beat valido rilevato")
+
+            avg_interval = float(np.mean(beat_intervals_sec))
+            st.info(f"🎵 BPM: **{bpm_value:.1f}** — {n_beats_detected} beat rilevati (intervallo medio {avg_interval:.2f}s) — "
+                    f"durata brano: **{audio_duration_sec:.1f}s** — le transizioni seguono il ritmo reale del brano.")
         except ImportError:
             st.warning("⚠️ librosa non installato. pip install librosa. Procedo senza sync.")
-            frames_per_transition = int(FPS * duration / num_transitions)
             full_song_mode = False
         except Exception as e:
             st.warning(f"⚠️ Errore analisi audio: {e}. Procedo senza sync.")
-            frames_per_transition = int(FPS * duration / num_transitions)
             full_song_mode = False
-    else:
-        frames_per_transition = int(FPS * duration / num_transitions)
 
-    # ── Calcola quante transizioni servono ──────────
-    if full_song_mode and audio_duration_sec:
-        total_video_frames_needed = int(audio_duration_sec * FPS)
-        total_transitions_needed = max(num_transitions, int(np.ceil(total_video_frames_needed / frames_per_transition)))
-    else:
-        total_transitions_needed = num_transitions
-
-    # ── Generazione frame (con ciclo immagini se full_song) ──
-    all_frames = []
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    for i in range(total_transitions_needed):
-        idx1 = i % len(images)
-        idx2 = (i + 1) % len(images)
-        status.text(f"Elaborazione transizione {i+1}/{total_transitions_needed}...")
-        frames = effect_funcs[effect_choice](
-            images[idx1], images[idx2], frames_per_transition, intensity, easing_choice
-        )
-        all_frames.extend(frames)
-        progress.progress((i + 1) / total_transitions_needed)
-
-        # Stop se in modalità full_song e abbiamo abbastanza frame
+    # ── Costruzione lista frame-per-transizione ─────
+    if beat_intervals_sec is not None and len(beat_intervals_sec) > 0:
         if full_song_mode and audio_duration_sec:
-            if len(all_frames) >= int(audio_duration_sec * FPS):
-                break
+            # un intervallo di beat reale = una transizione, copre l'intero brano una sola volta
+            frames_per_transition_list = [max(4, int(round(iv * FPS))) for iv in beat_intervals_sec]
+        else:
+            # durata manuale: ripetiamo il pattern ritmico rilevato finché non copriamo 'duration'
+            target_frames = int(FPS * duration)
+            frames_per_transition_list = []
+            total, j = 0, 0
+            while total < target_frames:
+                iv = beat_intervals_sec[j % len(beat_intervals_sec)]
+                fpt = max(4, int(round(iv * FPS)))
+                frames_per_transition_list.append(fpt)
+                total += fpt
+                j += 1
+    else:
+        # nessuna musica: comportamento invariato, durata divisa sulle transizioni fisse
+        frames_per_transition_list = [max(4, int(FPS * duration / num_transitions))] * num_transitions
 
-    # Tronca esattamente alla durata del brano se full_song
-    if full_song_mode and audio_duration_sec:
-        all_frames = all_frames[:int(audio_duration_sec * FPS)]
+    total_transitions_needed = len(frames_per_transition_list)
+    target_total_frames = int(audio_duration_sec * FPS) if (full_song_mode and audio_duration_sec) else None
 
-    status.text("Scrittura video...")
-
-    # ── Scrivi video ────────────────────────────────
+    # ── Generazione + scrittura in streaming (niente più RAM piena di frame) ──
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmpfile:
         video_path = tmpfile.name
 
     writer = imageio.get_writer(video_path, fps=FPS, codec="libx264", quality=8)
-    for frame in all_frames:
-        writer.append_data(frame)
+    progress = st.progress(0.0)
+    status = st.empty()
+    rnd = random.Random()
+    mixed_effects_used = []
+    total_frames_written = 0
+
+    for i in range(total_transitions_needed):
+        idx1, idx2 = get_pair_indices(i, image_sequence)
+        eff_name = pick_effect_for_transition(effect_choice, rnd)
+        if effect_choice == MIXED_LABEL:
+            mixed_effects_used.append(eff_name)
+        status.text(f"Elaborazione transizione {i+1}/{total_transitions_needed} — {eff_name}...")
+
+        frames = effect_funcs[eff_name](
+            images[idx1], images[idx2], frames_per_transition_list[i], intensity, easing_choice
+        )
+        for fr in frames:
+            if target_total_frames is not None and total_frames_written >= target_total_frames:
+                break
+            writer.append_data(fr)
+            total_frames_written += 1
+
+        progress.progress((i + 1) / total_transitions_needed)
+
+        if target_total_frames is not None and total_frames_written >= target_total_frames:
+            break
+
     writer.close()
+    status.text("Scrittura video completata...")
 
     # ── Mux audio se presente ───────────────────────
     final_video_path = video_path
@@ -509,7 +673,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     with open(final_video_path, "rb") as f:
         st.session_state["video_bytes"] = f.read()
 
-    total_frames = len(all_frames)
+    total_frames = total_frames_written
     actual_duration = total_frames / FPS
     w, h = target_size
     resolution_str = f"{w}×{h}px"
@@ -530,6 +694,9 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         "music_name": music_name,
         "full_song_mode": full_song_mode,
         "audio_duration": audio_duration_sec,
+        "n_beats_detected": n_beats_detected,
+        "loop_mode": loop_mode,
+        "mixed_effects": sorted(set(mixed_effects_used)) if mixed_effects_used else None,
     }
     st.session_state["report_text"] = generate_report(report_params)
     st.session_state["video_ready"] = True
