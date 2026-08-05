@@ -740,7 +740,10 @@ elif video_btn:
 if st.session_state.get("video_ready"):
     st.divider()
     has_audio = st.session_state.get("audio_bytes") is not None
-    dl_cols = st.columns(3 if has_audio else 2)
+    # NB: numero di colonne SEMPRE fisso (3) per evitare che la struttura del
+    # layout cambi da un rerun all'altro (causa nota di crash "removeChild"
+    # nel frontend di Streamlit quando st.columns() riceve un numero variabile).
+    dl_cols = st.columns(3)
 
     with dl_cols[0]:
         st.download_button(
@@ -749,6 +752,7 @@ if st.session_state.get("video_ready"):
             file_name="loop507_output.mp4",
             mime="video/mp4",
             use_container_width=True,
+            key="dl_video_btn",
         )
 
     with dl_cols[1]:
@@ -758,17 +762,19 @@ if st.session_state.get("video_ready"):
             file_name="loop507_report.txt",
             mime="text/plain",
             use_container_width=True,
+            key="dl_report_btn",
         )
 
-    if has_audio:
-        audio_ext = os.path.splitext(st.session_state["audio_name"])[1]
-        with dl_cols[2]:
+    with dl_cols[2]:
+        if has_audio:
+            audio_ext = os.path.splitext(st.session_state["audio_name"])[1]
             st.download_button(
                 label=f"🎵 Scarica Audio ({audio_ext})",
                 data=st.session_state["audio_bytes"],
                 file_name=st.session_state["audio_name"],
                 mime="audio/mpeg" if audio_ext == ".mp3" else "audio/wav",
                 use_container_width=True,
+                key="dl_audio_btn",
             )
 
     with st.expander("👁️ Anteprima report"):
