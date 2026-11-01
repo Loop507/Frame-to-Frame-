@@ -6,7 +6,6 @@ import imageio.v2 as imageio  # API legacy get_writer: la v3 la dichiara obsolet
 import os
 import tempfile
 import random
-import datetime
 import subprocess
 
 st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator 3.1 by Loop507", layout="wide")
@@ -39,6 +38,62 @@ def _blend(img1, img2, a):
 def _env(a):
     """Inviluppo 0→1→0 sulla transizione: gli effetti 'a impulso' partono e finiscono a riposo."""
     return float(np.sin(np.pi * a))
+
+# ─────────────────────────────────────────────
+# AUDIO FEATURES — una riga per frame video (allineate al brano, 0..1)
+# ─────────────────────────────────────────────
+N_BANDS = 32
+
+def _smooth_ad(x, attack, decay):
+    """Inseguitore attacco/rilascio lungo l'asse 0 (1D o 2D): sale in fretta, scende piano."""
+    x = np.asarray(x, dtype=np.float64)
+    out = np.empty_like(x)
+    v = np.zeros(x.shape[1:])
+    for i in range(len(x)):
+        v = v + (x[i] - v) * np.where(x[i] > v, attack, decay)
+        out[i] = v
+    return out
+
+class AudioFeatures:
+    """rms, onset, kick, bass, mid, high: array (n,)   bands: array (n, N_BANDS)   — tutti in 0..1
+    onset = qualsiasi colpo (kick, rullante, hat);  kick = solo colpi sulle frequenze basse"""
+    def __init__(self, rms, onset, bass, mid, high, bands, kick=None):
+        self.rms, self.onset, self.bass = rms, onset, bass
+        self.mid, self.high, self.bands = mid, high, bands
+        self.kick = onset if kick is None else kick
+
+    def __len__(self):
+        return len(self.rms)
+
+    def slice(self, start, n):
+        def cut(a):
+            seg = a[start:start + n]
+            if len(seg) < n:  # oltre la fine del brano → silenzio
+                seg = np.pad(seg, [(0, n - len(seg))] + [(0, 0)] * (a.ndim - 1))
+            return seg
+        return AudioFeatures(cut(self.rms), cut(self.onset), cut(self.bass),
+                             cut(self.mid), cut(self.high), cut(self.bands), kick=cut(self.kick))
+
+    @classmethod
+    def synthetic(cls, n, fps=24, rng=None):
+        """Ritmo finto a 120 BPM (kick + rumore liscio): gli effetti audio-reattivi
+        restano vivi anche senza brano (anteprima, modalità senza musica)."""
+        rng = rng or random.Random(0)
+        g = np.random.default_rng(rng.randrange(2**31))
+        n = max(1, int(n))
+        onset = np.zeros(n)
+        onset[::max(4, int(round(fps * 0.5)))] = 1.0
+        onset = np.clip(_smooth_ad(onset, 1.0, 0.35), 0, 1)
+        noise = lambda: np.clip(_smooth_ad(g.random(n), 0.3, 0.3) * 1.6 - 0.2, 0, 1)
+        bass = np.clip(0.15 + 0.85 * onset, 0, 1)
+        rms = np.clip(0.25 + 0.5 * onset + 0.25 * noise(), 0, 1)
+        bands = np.clip(_smooth_ad(g.random((n, N_BANDS)), 0.4, 0.3) * 1.2 - 0.1 + onset[:, None] * 0.4, 0, 1)
+        return cls(rms, onset, bass, noise(), noise(), bands)
+
+def _au(audio, n):
+    if audio is None or len(audio) < n:
+        return AudioFeatures.synthetic(n, 24, random.Random(random.randrange(2**31)))
+    return audio
 
 # ─────────────────────────────────────────────
 # EFFETTI — tutti generatori (yield): un frame alla volta, niente liste in RAM.
@@ -255,6 +310,183 @@ def light_leaks_effect(img1, img2, num_frames, intensity, easing, alphas=None):
         leak = cv2.resize(leak_small, (w, h), interpolation=cv2.INTER_LINEAR)
         yield cv2.addWeighted(frame, 1, leak, 0.3, 0)
 
+
+# ─────────────────────────────────────────────
+# EFFETTI AUDIO-REATTIVI — firma: (..., alphas=None, audio=None)
+# 'audio' è la fetta di AudioFeatures dei frame di QUESTA transizione.
+# ─────────────────────────────────────────────
+def _flow_full(img1, img2):
+    """Optical flow Farneback img1→img2 a metà risoluzione, riportato a piena (px)."""
+    h, w = img1.shape[:2]
+    scale = 0.5 if max(h, w) > 480 else 1.0
+    sw, sh = max(8, int(w * scale)), max(8, int(h * scale))
+    g1 = cv2.cvtColor(cv2.resize(img1, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+    g2 = cv2.cvtColor(cv2.resize(img2, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(g1, g2, None, pyr_scale=0.5, levels=4, winsize=21,
+                                        iterations=3, poly_n=5, poly_sigma=1.1, flags=0)
+    flow = cv2.GaussianBlur(flow, (0, 0), 3)
+    return (cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / scale).astype(np.float32)
+
+def _chroma_split(frame, shift):
+    h, w = frame.shape[:2]
+    r, g, b = cv2.split(frame)
+    r = cv2.warpAffine(r, np.float32([[1, 0, shift], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REPLICATE)
+    b = cv2.warpAffine(b, np.float32([[1, 0, -shift], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REPLICATE)
+    return cv2.merge([r, g, b])
+
+def spectrum_reveal_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """img2 emerge dal basso attraverso un equalizzatore: ogni barra segue la SUA banda dello spettro,
+    con tappi bianchi sui picchi e spaziature tra le barre che compaiono a metà transizione."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    nbars = 48
+    bar_w = w / nbars
+    bar_idx = np.minimum((np.arange(w) // bar_w).astype(int), nbars - 1)
+    gap = ((np.arange(w) % bar_w) / bar_w) > 0.88
+    y_norm = ((h - 1 - np.arange(h)) / h).astype(np.float32)[:, None]
+    band_x = np.linspace(0, N_BANDS - 1, nbars)
+    spread = 0.35 + intensity / 40.0
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    for k, a in enumerate(al):
+        env = _env(a)
+        e_bars = np.interp(band_x, np.arange(N_BANDS), au.bands[k])
+        f_bar = np.clip(a + spread * env * (e_bars - 0.5) * 1.5, 0, 1)
+        f_col = f_bar[bar_idx].astype(np.float32)[None, :]
+        mask = np.clip((f_col - y_norm) * (h / 8.0) + 0.5, 0, 1)
+        mask[:, gap] *= (1.0 - env ** 2)
+        m3 = mask[:, :, None]
+        out = f1 * (1 - m3) + f2 * m3
+        cap = (np.abs(f_col - y_norm) * h < 2.5).astype(np.float32)[:, :, None] * (env * (0.4 + 0.6 * float(au.rms[k])))
+        out = out * (1 - cap) + 255.0 * cap
+        yield np.clip(out, 0, 255).astype(np.uint8)
+
+def kick_zoom_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Evoluzione di Zoom Random: ad ogni colpo (onset) il fuoco SALTA in un punto nuovo, lo zoom
+    scatta, l'immagine ruota di un soffio e i canali RGB si separano. Il basso fa tremare l'inquadratura."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    amp = intensity / 50.0
+    cx, cy, direction, prev_kick = w / 2.0, h / 2.0, 1, 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass = float(au.kick[k]), float(au.bass[k])
+        if kick > 0.55 and prev_kick <= 0.55:
+            cx, cy = random.randint(w // 4, 3 * w // 4), random.randint(h // 4, 3 * h // 4)
+            direction = random.choice((-1, 1))
+        prev_kick = kick
+        zoom = 1.0 + amp * env * (0.4 + 1.0 * kick)
+        M = cv2.getRotationMatrix2D((cx, cy), direction * kick * env * amp * 4.0, zoom)
+        M[0, 2] += random.uniform(-1, 1) * bass * env * amp * 40
+        M[1, 2] += random.uniform(-1, 1) * bass * env * amp * 40
+        z1 = cv2.warpAffine(img1, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        z2 = cv2.warpAffine(img2, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        yield _chroma_split(_blend(z1, z2, a), kick * env * amp * 30.0)
+
+def flow_smear_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Datamosh a vettori di moto: i pixel di img1 vengono TRASCINATI lungo l'optical flow verso img2
+    in modo ricorsivo (nessun crossfade). Kick e volume spingono il movimento; img2 emerge prima
+    dove c'è poco moto e per ultima dove il moto è forte."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    flow = _flow_full(img1, img2)
+    mag = np.linalg.norm(flow, axis=2)
+    mag_n = np.clip(mag / (np.percentile(mag, 95) + 1e-6), 0, 1)
+    thr = (0.15 + 0.7 * (1.0 - mag_n)).astype(np.float32)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    f2 = img2.astype(np.float32)
+    cur = img1.copy()
+    amp = intensity / 15.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        g = (0.05 + 0.30 * float(au.onset[k]) + 0.12 * float(au.rms[k])) * amp * (env ** 0.5)
+        g = min(g, 0.7)
+        cur = cv2.remap(cur, xs - g * flow[..., 0], ys - g * flow[..., 1],
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        wmap = np.clip((a * 1.25 - thr) / 0.25, 0, 1)[:, :, None]
+        yield (cur.astype(np.float32) * (1 - wmap) + f2 * wmap).astype(np.uint8)
+
+def block_shuffle_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Macroblocchi corrotti: la transizione avviene a blocchi (ognuno con la sua soglia), e ad ogni
+    colpo una raffica di blocchi viene spostata e, sui colpi forti, invertita. Il basso allarga lo scarto."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    bs = int(np.clip(80 - intensity * 1.2, 16, 64))
+    nby, nbx = -(-h // bs), -(-w // bs)
+    tau = np.random.uniform(0, 0.9, (nby, nbx))
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    up = lambda m: np.repeat(np.repeat(m, bs, axis=0), bs, axis=1)[:h, :w]
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass, rms = float(au.onset[k]), float(au.bass[k]), float(au.rms[k])
+        base = np.where(up(a > tau)[:, :, None], img2, img1)
+        p = float(np.clip(0.03 + 0.85 * kick + 0.25 * rms, 0, 1)) * env
+        M = np.random.random((nby, nbx)) < p
+        dx = np.where(M, np.random.randint(-2, 3, (nby, nbx)) * bs * (0.5 + bass), 0).astype(np.float32)
+        dy = np.where(M, np.random.randint(-1, 2, (nby, nbx)) * bs * 0.5 * (0.5 + bass), 0).astype(np.float32)
+        out = cv2.remap(base, xs - up(dx), ys - up(dy), cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)
+        if kick > 0.6:
+            inv = up(M & (np.random.random((nby, nbx)) < 0.25 * (kick - 0.4)))
+            out[inv] = 255 - out[inv]
+        yield out
+
+def slit_scan_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Fronte d'onda ondulato che spazza l'immagine: la forma dell'onda si muove con le medie
+    (fase) e si gonfia con i bassi (ampiezza); lungo il fronte i pixel vengono tirati
+    orizzontalmente in proporzione al volume — effetto slit-scan."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xn = (np.arange(w) / w).astype(np.float32)[None, :]
+    yn = (np.arange(h) / h).astype(np.float32)[:, None]
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    freq, soft, phase = 2.0 + intensity / 12.0, 0.22, 0.0
+    for k, a in enumerate(al):
+        bass, mid, rms = float(au.bass[k]), float(au.mid[k]), float(au.rms[k])
+        phase += 0.12 + 0.8 * mid
+        amp_w = min(0.45, 0.30 * (0.35 + bass))
+        q = np.clip(0.15 + 0.7 * xn + amp_w * np.sin(2 * np.pi * freq * yn + phase), 0, 1)
+        m = np.clip((a - q * (1 - soft)) / soft, 0, 1)
+        out = (f1 * (1 - m[:, :, None]) + f2 * m[:, :, None]).astype(np.uint8)
+        edge = 4.0 * m * (1.0 - m)
+        disp = intensity * 1.5 * (0.3 + rms) * np.sin(2 * np.pi * yn * freq * 3 - phase * 2)
+        yield cv2.remap(out, xs + edge * disp, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def feedback_tunnel_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Video feedback: ogni frame rientra nel successivo, ingrandito e ruotato, con deriva di tinta.
+    Il volume decide quanta traccia resta, i bassi la rotazione, gli alti la velocità del colore;
+    ogni colpo accende un flash."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    amp = intensity / 15.0
+    prev = None
+    for k, a in enumerate(al):
+        env = _env(a)
+        rms, bass, high, kick = float(au.rms[k]), float(au.bass[k]), float(au.high[k]), float(au.kick[k])
+        cur = _blend(img1, img2, a)
+        if prev is None:
+            out = cur
+        else:
+            M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), (bass - 0.5) * 3.0 * amp, 1.0 + 0.02 + 0.05 * rms * amp)
+            pt = cv2.warpAffine(prev, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+            hsv = cv2.cvtColor(pt, cv2.COLOR_RGB2HSV)
+            hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + int(3 + 14 * high)) % 180).astype(np.uint8)
+            pt = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+            fb = float(np.clip(0.55 + 0.4 * rms, 0, 0.93)) * env
+            out = cv2.addWeighted(cur, 1 - fb, pt, fb, 0)
+        flash = int(kick * intensity * 1.5 * env)
+        if flash > 0:
+            out = cv2.add(out, (flash, flash, flash, 0))
+        prev = out
+        yield out
+
+AUDIO_EFFECTS = {"Spectrum Reveal", "Kick Zoom", "Flow Smear", "Block Shuffle", "Slit Scan", "Feedback Tunnel"}
+
 # ── Combo: UNA curva alpha globale tagliata in fette → continuità + frame esatti ──
 def _combo(funcs, img1, img2, num_frames, intensity, easing, alphas):
     full = _alphas(num_frames, easing, alphas)
@@ -297,34 +529,46 @@ effect_funcs = {
     "Scanlines": scanlines_effect,
     "Burn-in": burn_in_effect,
     "Light Leaks": light_leaks_effect,
+    "Spectrum Reveal": spectrum_reveal_effect,
+    "Kick Zoom": kick_zoom_effect,
+    "Flow Smear": flow_smear_effect,
+    "Block Shuffle": block_shuffle_effect,
+    "Slit Scan": slit_scan_effect,
+    "Feedback Tunnel": feedback_tunnel_effect,
     "Combo Creative 1": combo_effect_preset1,
     "Combo Creative 2": combo_effect_preset2,
     "Combo Creative 3": combo_effect_preset3,
 }
 
 effect_descriptions = {
-    "Fade": "Dissolvenza classica tra un frame e l'altro.",
-    "Morph": "Morph a optical flow (Farneback): i pixel scivolano da un'immagine all'altra, poi crossfade. DSP puro.",
-    "Glitch": "Artefatti digitali e distorsioni di riga tipici del segnale corrotto.",
-    "Pixelate": "Pixelazione progressiva con scala random per un look 8-bit.",
-    "Corrupt Lines": "Righe di dati corrotti che appaiono casualmente sul frame.",
-    "Wave Distort": "Distorsione ondulata sinusoidale delle righe orizzontali.",
-    "Zoom": "Punch-in dal centro che rientra a 1x a fine transizione.",
-    "Zoom Random": "Zoom da punto focale casuale per un effetto caotico, rientra a fine transizione.",
-    "Wipe Direzionale": "Spazzata orizzontale sinistra→destra con bordo sfumato.",
-    "Wipe Diagonale": "Spazzata diagonale angolo alto-sx → basso-dx con bordo sfumato.",
-    "Iris Circolare": "Apertura circolare dal centro verso i bordi, stile iris cinema.",
-    "Color Echo": "Aberrazione cromatica: canali R e B separati in direzioni opposte.",
-    "Particle Float": "Particelle bianche fluttuanti sopra il blend.",
-    "Film Look": "Grana cinematografica con flickering di esposizione.",
-    "VHS": "Artefatti da nastro magnetico con equalizzazione del canale rosso.",
-    "Motion Blur": "Sfocatura da movimento orizzontale sul frame blendato.",
-    "Scanlines": "Righe di scansione stile monitor CRT.",
-    "Burn-in": "Sovraimpressione di righe con effetto burn phosphor.",
-    "Light Leaks": "Aloni di luce colorata proiettati sul frame, stile analogico.",
-    "Combo Creative 1": "Glitch + Pixelate in sequenza (curva alpha continua).",
-    "Combo Creative 2": "Wave Distort + Color Echo + Particle Float in sequenza.",
-    "Combo Creative 3": "Motion Blur + Film Look + Zoom Random in sequenza.",
+    "Fade": "Classic dissolve between one frame and the next.",
+    "Morph": "Optical-flow morph (Farneback): pixels slide from one image to the other, then crossfade. Pure DSP.",
+    "Glitch": "Digital artifacts and row displacement typical of a corrupted signal.",
+    "Pixelate": "Progressive pixelation with random scale for an 8-bit look.",
+    "Corrupt Lines": "Corrupted data lines randomly appearing on the frame.",
+    "Wave Distort": "Sinusoidal wave distortion of the horizontal rows.",
+    "Zoom": "Punch-in from the center, returns to 1x at the end of the transition.",
+    "Zoom Random": "Zoom from a random focus for a chaotic effect, retracts at the end of the transition.",
+    "Wipe Direzionale": "Horizontal left-to-right wipe with a soft edge.",
+    "Wipe Diagonale": "Diagonal wipe from top-left to bottom-right corner with a soft edge.",
+    "Iris Circolare": "Circular opening from the center to the edges, cinema iris style.",
+    "Color Echo": "Chromatic aberration: R and B channels split in opposite directions.",
+    "Particle Float": "White floating particles over the blend.",
+    "Film Look": "Cinematic grain with exposure flicker.",
+    "VHS": "Magnetic tape artifacts with red-channel equalization.",
+    "Motion Blur": "Horizontal motion blur on the blended frame.",
+    "Scanlines": "CRT-monitor style scanlines.",
+    "Burn-in": "Line overlay with a phosphor burn-in effect.",
+    "Light Leaks": "Colored light halos projected on the frame, analog style.",
+    "Spectrum Reveal": "Audio-reactive: the next image rises through an equalizer, each bar following its own frequency band.",
+    "Kick Zoom": "Audio-reactive: the focus jumps on every hit, zoom and rotation snap on the kick, bass shakes the frame.",
+    "Flow Smear": "Audio-reactive datamosh: pixels are dragged along optical-flow vectors, pushed by kick and volume.",
+    "Block Shuffle": "Audio-reactive macroblock corruption: blocks displace and invert on every hit, bass widens the offset.",
+    "Slit Scan": "Audio-reactive wavefront sweep: mids move the wave, bass swells it, volume pulls pixels along the front.",
+    "Feedback Tunnel": "Audio-reactive video feedback: zoom, rotation and hue drift recirculate, kick triggers a flash.",
+    "Combo Creative 1": "Glitch + Pixelate in sequence (continuous alpha curve).",
+    "Combo Creative 2": "Wave Distort + Color Echo + Particle Float in sequence.",
+    "Combo Creative 3": "Motion Blur + Film Look + Zoom Random in sequence.",
 }
 
 # ─────────────────────────────────────────────
@@ -378,6 +622,12 @@ GRID_LABELS = {
     "×2 (suddividi ogni beat)": "double",
 }
 
+GRID_EN = {
+    "normal": "×1 (detected beats)",
+    "half": "×½ (one transition every 2 beats)",
+    "double": "×2 (split each beat)",
+}
+
 def adjust_beat_grid(beat_times, mode):
     """Corregge gli errori d'ottava del beat tracker (tempo dimezzato/raddoppiato)."""
     bt = np.asarray(beat_times, dtype=np.float64)
@@ -422,9 +672,48 @@ def repeat_pattern_to_length(pattern, target_frames, min_frames=4):
 # ─────────────────────────────────────────────
 # AUDIO: ANALISI + MUX
 # ─────────────────────────────────────────────
-def analyze_audio(audio_path, grid_mode):
+def extract_audio_features(y, sr, fps, n_bands=N_BANDS):
+    """RMS, onset, bassi/medi/alti e spettro a 32 bande, normalizzati 0..1 e ricampionati
+    sull'asse dei frame video (centro di ogni frame) con attacco rapido / rilascio lento."""
     import librosa
-    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    hop = 512
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+    t_stft = librosa.frames_to_time(np.arange(S.shape[1]), sr=sr, hop_length=hop)
+    n_video = int(np.ceil(len(y) / sr * fps)) + 2
+    t_video = (np.arange(n_video) + 0.5) / fps
+
+    def norm(x, lo=5, hi=99):
+        a, b = np.percentile(x, lo), np.percentile(x, hi)
+        return np.clip((x - a) / (b - a + 1e-9), 0, 1)
+
+    def to_video(x):
+        return np.interp(t_video, t_stft, x)
+
+    rms = norm(librosa.feature.rms(S=S, frame_length=2048, hop_length=hop)[0])
+    mel = librosa.feature.melspectrogram(S=S ** 2, sr=sr, n_mels=n_bands, fmax=min(16000.0, sr / 2.0))
+    mel_db = librosa.power_to_db(mel, ref=np.max, top_db=60)
+    bands = np.stack([norm(mel_db[b]) for b in range(n_bands)], axis=1)
+    onset = librosa.onset.onset_strength(S=mel_db, sr=sr, hop_length=hop)
+    onset = np.pad(onset, (0, max(0, S.shape[1] - len(onset))))[:S.shape[1]]
+    q = n_bands // 8
+    kick = librosa.onset.onset_strength(S=mel_db[:q], sr=sr, hop_length=hop)  # solo bassi → i colpi di cassa
+    kick = np.pad(kick, (0, max(0, S.shape[1] - len(kick))))[:S.shape[1]]
+
+    bass_t, mid_t, high_t = bands[:, :q].mean(1), bands[:, q:n_bands // 2].mean(1), bands[:, n_bands // 2:].mean(1)
+    bands_v = np.stack([to_video(bands[:, b]) for b in range(n_bands)], axis=1)
+    return AudioFeatures(
+        rms=_smooth_ad(to_video(rms), 0.6, 0.25),
+        onset=np.clip(_smooth_ad(to_video(norm(onset)), 0.9, 0.35), 0, 1),
+        kick=np.clip(_smooth_ad(to_video(norm(kick)), 0.9, 0.4), 0, 1),
+        bass=_smooth_ad(to_video(norm(bass_t)), 0.6, 0.3),
+        mid=_smooth_ad(to_video(norm(mid_t)), 0.6, 0.3),
+        high=_smooth_ad(to_video(norm(high_t)), 0.6, 0.3),
+        bands=np.clip(_smooth_ad(bands_v, 0.7, 0.3), 0, 1),
+    )
+
+def analyze_audio(audio_path, grid_mode, fps=24):
+    import librosa
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
     bpm = float(np.atleast_1d(tempo)[0])  # librosa >= 0.10 restituisce array
     bt = np.asarray(librosa.frames_to_time(beat_frames, sr=sr), dtype=np.float64)
@@ -435,7 +724,11 @@ def analyze_audio(audio_path, grid_mode):
     if bt[-1] < duration - 0.05:
         bt = np.append(bt, duration)
     bt = adjust_beat_grid(bt, grid_mode)
-    return bpm, bt, duration, n_detected
+    try:
+        features = extract_audio_features(y, sr, fps)
+    except Exception:
+        features = None  # il beat-sync funziona comunque; gli effetti audio usano il ritmo sintetico
+    return bpm, bt, duration, n_detected, features
 
 def get_ffmpeg_path():
     """ffmpeg incluso in imageio-ffmpeg: nessun packages.txt necessario su Streamlit Cloud."""
@@ -459,12 +752,14 @@ def mux_audio(video_path, audio_path):
 # RENDER IN STREAMING
 # ─────────────────────────────────────────────
 def build_video(images, image_sequence, frame_counts, effect_choice, intensity, easing,
-                ffmpeg_preset, fps, rnd, on_progress=None):
+                ffmpeg_preset, fps, rnd, on_progress=None, features=None):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         video_path = tmp.name
     writer = imageio.get_writer(video_path, fps=fps, codec="libx264", quality=8,
                                 output_params=["-preset", ffmpeg_preset])
-    mixed_used, written = [], 0
+    mixed_used, written, cursor = [], 0, 0
+    if features is None:  # senza brano: ritmo sintetico, ma deterministico (seed)
+        features = AudioFeatures.synthetic(sum(frame_counts), fps, rnd)
     try:
         for i, n_fr in enumerate(frame_counts):
             idx1, idx2 = get_pair_indices(i, image_sequence)
@@ -473,7 +768,9 @@ def build_video(images, image_sequence, frame_counts, effect_choice, intensity, 
                 mixed_used.append(eff_name)
             if on_progress:
                 on_progress(i, len(frame_counts), eff_name)
-            for fr in effect_funcs[eff_name](images[idx1], images[idx2], n_fr, intensity, easing):
+            kwargs = {"audio": features.slice(cursor, n_fr)} if eff_name in AUDIO_EFFECTS else {}
+            cursor += n_fr
+            for fr in effect_funcs[eff_name](images[idx1], images[idx2], n_fr, intensity, easing, **kwargs):
                 writer.append_data(fr)
                 written += 1
     finally:
@@ -489,96 +786,57 @@ def _safe_remove(*paths):
             pass
 
 # ─────────────────────────────────────────────
-# REPORT BILINGUE IT / EN  (formato  "IT / EN :: valore")
+# REPORT  (formato  "Label :: value", numerato per sessione)
 # ─────────────────────────────────────────────
-def _row(it, en, value):
-    return f"{(it + ' / ' + en).ljust(30)} :: {value}"
+def _clean_tag(name):
+    return "".join(ch for ch in name if ch.isalnum())
 
 def generate_report(p: dict) -> str:
-    now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
-    line = "━" * 37
+    line = "━" * 6
+    is_mixed = p["effect"] == MIXED_LABEL
+    effect_name = "Mixed sequence" if is_mixed else p["effect"]
     rows = [
-        _row("Effetto", "Effect", p["effect"]),
-        _row("Easing", "Easing", p["easing"]),
-        _row("Formato", "Format", p["format"]),
-        _row("Risoluzione", "Resolution", p["resolution"]),
-        _row("Durata", "Duration", f"{p['duration']} s"),
-        _row("FPS", "FPS", p["fps"]),
-        _row("Frame totali", "Total frames", p["total_frames"]),
-        _row("Immagini", "Images", p["num_images"]),
-        _row("Transizioni", "Transitions", p["num_transitions"]),
-        _row("Intensità", "Intensity", f"{p['intensity']} / 50"),
-        _row("Seed", "Seed", p["seed"]),
-        _row("Preset encoding", "Encoding preset", p["ffmpeg_preset"]),
+        f"Effect :: {effect_name}",
+        f"Easing :: {p['easing']}",
+        f"Format :: {p['format']}",
+        f"Resolution :: {p['resolution']}",
+        f"Duration :: {p['duration']} s",
+        f"FPS :: {p['fps']}",
+        f"Total frames :: {p['total_frames']}",
+        f"Images :: {p['num_images']}",
+        f"Transitions :: {p['num_transitions']}",
+        f"Intensity :: {p['intensity']} / 50",
+        f"Seed :: {p['seed']}",
+        f"Encoding preset :: {p['ffmpeg_preset']}",
     ]
     if p.get("loop_mode") == "ping_pong":
-        rows.append(_row("Loop", "Loop", "ping-pong"))
+        rows.append("Loop :: ping-pong")
     if p.get("mixed_effects"):
-        rows.append(_row("Sequenza mista", "Mixed sequence", ", ".join(p["mixed_effects"])))
+        rows.append("Mixed effects :: " + ", ".join(p["mixed_effects"]))
 
     if p.get("music_enabled") and p.get("bpm"):
-        audio_dur = f"{p['audio_duration']:.1f} s" if p.get("audio_duration") else "—"
         audio_rows = [
-            _row("File audio", "Audio file", p["music_name"]),
-            _row("BPM medio", "Avg BPM", f"{p['bpm']:.1f}"),
-            _row("Beat rilevati", "Beats detected", p.get("n_beats_detected") or "—"),
-            _row("Griglia beat", "Beat grid", p.get("beat_grid_label", "—")),
-            _row("Durata brano", "Track length", audio_dur),
-            _row("Modalità durata", "Duration mode",
-                 "Tutto il brano / Full track" if p.get("full_song_mode") else "Manuale / Manual"),
+            f"Audio files :: {p['music_name']}",
+            f"Avg BPM :: {p['bpm']:.1f}",
+            f"Beats detected :: {p.get('n_beats_detected') or '—'}",
+            f"Beat grid :: {p.get('beat_grid_label', '—')}",
+            f"Track length :: {p['audio_duration']:.1f} s" if p.get("audio_duration") else "Track length :: —",
+            f"Duration mode :: {'Full track' if p.get('full_song_mode') else 'Manual'}",
         ]
     else:
-        audio_rows = ["🔇 Nessun audio / No audio"]
+        audio_rows = ["No audio"]
 
-    desc = effect_descriptions.get(p["effect"], "Effetto random diverso per ogni transizione (sequenza mista).")
-    tag = "SequenzaMista" if p["effect"] == MIXED_LABEL else p["effect"].replace(" ", "")
-    sync_line = (f"🎵 Beat-sync @ {p['bpm']:.1f} BPM — {p['music_name']}"
-                 if p.get("music_enabled") and p.get("bpm") else "")
-    stack = "Python · OpenCV · NumPy · imageio · Streamlit"
-    if p.get("music_enabled"):
-        stack += " · librosa · ffmpeg"
+    desc = ("A different random effect for each transition." if is_mixed
+            else effect_descriptions.get(p["effect"], ""))
+    tag = "MixedSequence" if is_mixed else _clean_tag(p["effect"])
 
-    report = f"""
-╔══════════════════════════════════════════╗
-║  🎞️  FRAME-TO-FRAME FX 3.1 — by Loop507  ║
-╚══════════════════════════════════════════╝
-
-Generato il / Generated :: {now}
-
-{line}
-🎬 PARAMETRI / PARAMETERS
-{line}
-{chr(10).join(rows)}
-
-{line}
-🎵 AUDIO
-{line}
-{chr(10).join(audio_rows)}
-
-{line}
-📝 DESCRIZIONE / DESCRIPTION
-{line}
-{desc}
-
-{line}
-📣 CAPTION SOCIAL / YOUTUBE
-{line}
-🎞️ {p['effect']} transition — {p['format']} | {p['duration']}s | {p['fps']}fps | seed {p['seed']}
-Creato con Frame-to-Frame FX by Loop507 / Made with Frame-to-Frame FX by Loop507
-{sync_line}
-
-#VideoArt #FrameToFrame #Loop507 #VisualFX #{tag} #TransitionFX #Reels #Shorts
-
-{line}
-🛠️  STACK
-{line}
-{stack}
-
-╔══════════════════════════════════════════╗
-║         Loop507 — All rights reserved    ║
-╚══════════════════════════════════════════╝
-"""
-    return report.strip()
+    out = [f"FRAME-TO-FRAME :: {p.get('report_no', 1):03d}", line, "PARAMETERS", line]
+    out += rows
+    out += [line, "AUDIO", line]
+    out += audio_rows
+    out += ["", line, "DESCRIPTION", line, desc, "",
+            f"#VideoArt #FrameToFrame #VisualFX #{tag} #TransitionFX"]
+    return "\n".join(out)
 
 # ─────────────────────────────────────────────
 # SESSION STATE INIT
@@ -587,6 +845,8 @@ STATE_KEYS = ["video_bytes", "audio_bytes", "audio_name", "report_text", "video_
 for key in STATE_KEYS:
     if key not in st.session_state:
         st.session_state[key] = None
+if "report_counter" not in st.session_state:
+    st.session_state["report_counter"] = 0  # NON azzerato a ogni generazione
 
 # ─────────────────────────────────────────────
 # INTERFACCIA
@@ -606,6 +866,9 @@ with col2:
     effect_choice = st.selectbox("Effetto", list(effect_funcs.keys()) + [MIXED_LABEL])
     easing_choice = st.selectbox("Curva easing", ["smootherstep", "smoothstep", "sinusoidal", "linear"])
     format_choice = st.selectbox("Formato video", ["1:1", "16:9", "9:16"])
+    if effect_choice in AUDIO_EFFECTS or effect_choice == MIXED_LABEL:
+        st.caption("🔊 Effetto audio-reattivo: segue kick, bassi, medi, alti e spettro del brano caricato. "
+                   "Senza brano (e nell'anteprima) usa un ritmo sintetico a 120 BPM.")
 
 col3, col4 = st.columns(2)
 with col3:
@@ -695,7 +958,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     image_sequence = build_image_sequence(len(images), loop_mode)
     num_transitions = len(images) - 1
 
-    bpm_value = music_name = tmp_audio_path = audio_duration_sec = n_beats_detected = beat_times = None
+    bpm_value = music_name = tmp_audio_path = audio_duration_sec = n_beats_detected = beat_times = audio_features = None
     full_song_mode = (duration_mode == "🎵 Tutto il brano" and use_music and audio_file is not None)
     grid_mode = GRID_LABELS[grid_label]
 
@@ -711,7 +974,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
             st.session_state["audio_name"] = audio_file.name
             music_name = audio_file.name
 
-            bpm_value, beat_times, audio_duration_sec, n_beats_detected = analyze_audio(tmp_audio_path, grid_mode)
+            bpm_value, beat_times, audio_duration_sec, n_beats_detected, audio_features = analyze_audio(tmp_audio_path, grid_mode, FPS)
             pattern = beat_frame_counts(beat_times, FPS)
             if not pattern:
                 raise ValueError("nessun intervallo di beat valido rilevato")
@@ -745,7 +1008,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
 
     video_path, total_frames_written, mixed_effects_used = build_video(
         images, image_sequence, frame_counts, effect_choice, intensity, easing_choice,
-        ffmpeg_preset, FPS, rnd, _on_progress)
+        ffmpeg_preset, FPS, rnd, _on_progress, audio_features)
     progress.progress(1.0)
     status.text("Scrittura video completata...")
 
@@ -775,9 +1038,11 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
         "music_enabled": use_music and audio_file is not None, "bpm": bpm_value,
         "music_name": music_name, "full_song_mode": full_song_mode,
         "audio_duration": audio_duration_sec, "n_beats_detected": n_beats_detected,
-        "beat_grid_label": grid_label, "loop_mode": loop_mode, "ffmpeg_preset": ffmpeg_preset,
+        "beat_grid_label": GRID_EN[grid_mode], "loop_mode": loop_mode, "ffmpeg_preset": ffmpeg_preset,
         "mixed_effects": sorted(set(mixed_effects_used)) if mixed_effects_used else None,
     }
+    st.session_state["report_counter"] += 1
+    report_params["report_no"] = st.session_state["report_counter"]
     st.session_state["report_text"] = generate_report(report_params)
     st.session_state["video_ready"] = True
 
