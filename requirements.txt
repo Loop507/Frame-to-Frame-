@@ -1,8 +1,7 @@
-streamlit>=1.35.0
-numpy>=1.24.0
-opencv-python-headless>=4.8.0
-Pillow>=10.0.0
-imageio>=2.31.0
-imageio-ffmpeg>=0.4.9
-librosa>=0.10.0
-soundfile>=0.12.1
+streamlit>=1.66,<2
+numpy>=2.5,<3
+opencv-python-headless>=5.0,<6
+pillow>=13.0,<14
+imageio>=2.38,<3
+imageio-ffmpeg>=0.7,<1
+librosa>=1.0,<2
