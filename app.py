@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 import imageio.v2 as imageio  # API legacy get_writer: la v3 la dichiara obsoleta
 import os
 import tempfile
@@ -9,6 +9,11 @@ import random
 import subprocess
 
 st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator 3.1 by Loop507", layout="wide")
+
+# Limiti di sicurezza per la RAM (Streamlit Community Cloud: ~1 GB garantiti, fino a 2.7 GB).
+# Il vincolo vero sono i MB caricati (Streamlit li tiene tutti in memoria), non il numero di foto.
+MAX_IMAGES = 40
+MAX_UPLOAD_MB = 150
 
 # ─────────────────────────────────────────────
 # ALPHA / EASING
@@ -485,7 +490,193 @@ def feedback_tunnel_effect(img1, img2, num_frames, intensity, easing, alphas=Non
         prev = out
         yield out
 
-AUDIO_EFFECTS = {"Spectrum Reveal", "Kick Zoom", "Flow Smear", "Block Shuffle", "Slit Scan", "Feedback Tunnel"}
+def pixel_sort_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Pixel sorting a blocchi: righe a caso vengono ordinate per luminosità in segmenti. I colpi
+    (kick) decidono QUANTE righe, i bassi la lunghezza dei segmenti (16→256 px), e ogni colpo
+    forte inverte la direzione (orizzontale ↔ verticale)."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    lum_w = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    amp = min(1.0, intensity / 20.0 + 0.3)
+    vertical, prev = False, 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass = float(au.kick[k]), float(au.bass[k])
+        if kick > 0.55 and prev <= 0.55:
+            vertical = not vertical
+        prev = kick
+        frame = _blend(img1, img2, a)
+        p = float(np.clip((0.1 + 0.9 * kick) * env * amp, 0, 1))
+        L = 2 ** int(4 + 4 * min(0.999, bass))
+        work = np.ascontiguousarray(frame.transpose(1, 0, 2)) if vertical else frame
+        Hh, Ww = work.shape[:2]
+        n = Ww // L
+        idx = np.where(np.random.random(Hh) < p)[0]
+        if n >= 1 and len(idx) > 0:
+            sub = work[idx, :n * L]
+            lum = (sub.astype(np.float32) @ lum_w).reshape(len(idx), n, L)
+            order = np.argsort(lum, axis=2)
+            chunks = sub.reshape(len(idx), n, L, 3)
+            work[idx, :n * L] = np.take_along_axis(chunks, order[..., None], axis=2).reshape(len(idx), n * L, 3)
+        yield np.ascontiguousarray(work.transpose(1, 0, 2)) if vertical else work
+
+def shockwave_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Onde d'urto: ogni kick fa nascere un anello che si espande da un punto a caso e deforma
+    l'immagine come acqua; i canali RGB si rifrangono in modo diverso (aberrazione). Fino a 4 anelli."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    size = float(max(h, w))
+    speed, width = 0.04 * size, 0.09 * size
+    rings, prev = [], 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick = float(au.kick[k])
+        if kick > 0.5 and prev <= 0.5:
+            cx, cy = random.uniform(0.25 * w, 0.75 * w), random.uniform(0.25 * h, 0.75 * h)
+            dx, dy = xs - cx, ys - cy
+            dist = np.sqrt(dx * dx + dy * dy) + 1e-3
+            rings = (rings + [{"dx": dx / dist, "dy": dy / dist, "dist": dist, "age": 0, "amp": kick}])[-4:]
+        prev = kick
+        frame = _blend(img1, img2, a)
+        ox, oy = np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
+        for r in rings:
+            r["age"] += 1
+            u = (r["dist"] - r["age"] * speed) / width
+            prof = np.exp(-u * u) * np.sin(u * 3.0)
+            amp_px = float(r["amp"] * intensity * 3.4 * np.exp(-r["age"] * 0.10) * env)
+            ox += amp_px * prof * r["dx"]
+            oy += amp_px * prof * r["dy"]
+        rings = [r for r in rings if r["age"] < 40]
+        chans = [cv2.remap(c, xs - f * ox, ys - f * oy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                 for c, f in zip(cv2.split(frame), (1.35, 1.0, 0.65))]
+        yield cv2.merge(chans)
+
+def kaleido_pulse_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Caleidoscopio a impulsi: lo specchio si accende a metà transizione, il numero di spicchi
+    cambia a ogni colpo (3–10), i medi lo fanno ruotare e i bassi lo dilatano."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    cx, cy = w / 2.0, h / 2.0
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    dx, dy = xs - cx, ys - cy
+    r, th = np.sqrt(dx * dx + dy * dy), np.arctan2(dy, dx)
+    n_seg, rot, prev = 6, 0.0, 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick = float(au.kick[k])
+        if kick > 0.55 and prev <= 0.55:
+            n_seg = random.choice((3, 4, 5, 6, 8, 10))
+        prev = kick
+        rot += 0.01 + 0.08 * float(au.mid[k])
+        seg = float(2 * np.pi / n_seg)
+        th_f = np.abs(((th + rot) % seg) - seg / 2.0)
+        rs = r * (1.0 + 0.25 * float(au.bass[k]))
+        frame = _blend(img1, img2, a)
+        kal = cv2.remap(frame, (cx + rs * np.cos(th_f)).astype(np.float32),
+                        (cy + rs * np.sin(th_f)).astype(np.float32),
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        m = float(np.clip(env ** 0.7 * (0.55 + 0.45 * kick), 0, 1))
+        yield cv2.addWeighted(frame, 1 - m, kal, m, 0)
+
+def time_slice_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Fette temporali: l'immagine è divisa in 32 fasce orizzontali (bassi in basso, acuti in alto);
+    ogni fascia pesca da un frame PASSATO tanto più vecchio quanto più forte è la sua banda di
+    frequenza, e scivola di lato. Lo spettro diventa letteralmente tempo."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    nb = 32
+    bounds = [(b * h // nb, (b + 1) * h // nb) for b in range(nb)]
+    hist = []
+    for k, a in enumerate(al):
+        env = _env(a)
+        hist = (hist + [_blend(img1, img2, a)])[-14:]
+        maxd = min(len(hist) - 1, int(2 + intensity / 4))
+        delays = np.round(np.clip(au.bands[k][::-1] * 1.2, 0, 1) * maxd * env).astype(int)
+        out = np.empty_like(hist[-1])
+        for b, (r0, r1) in enumerate(bounds):
+            d = int(delays[b])
+            src = hist[-1 - d][r0:r1]
+            shift = int(d * intensity * 0.6) * (1 if b % 2 else -1)
+            out[r0:r1] = np.roll(src, shift, axis=1) if shift else src
+        yield out
+
+def shatter_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Frantumazione: l'immagine si spezza in 36 schegge (Voronoi). Ogni scheggia passa a img2 al suo
+    momento; a ogni kick le schegge vengono SPARATE verso l'esterno e tornano al loro posto, mentre
+    le crepe si scuriscono in proporzione agli acuti."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    n = 36
+    seeds = np.random.rand(n, 2) * np.array([w, h])
+    sw, sh = max(8, w // 4), max(8, h // 4)
+    gx, gy = np.meshgrid(np.arange(sw) * 4.0, np.arange(sh) * 4.0)
+    d2 = (gx[..., None] - seeds[:, 0]) ** 2 + (gy[..., None] - seeds[:, 1]) ** 2
+    label = cv2.resize(np.argmin(d2, axis=2).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+    edges = ((label != np.roll(label, 1, 0)) | (label != np.roll(label, 1, 1))).astype(np.uint8)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8)).astype(bool)
+    tau = np.random.uniform(0, 0.85, n)
+    vec = seeds - np.array([w / 2.0, h / 2.0])
+    vec = vec / (np.linalg.norm(vec, axis=1, keepdims=True) + 1e-6) + np.random.uniform(-0.4, 0.4, (n, 2))
+    scale = np.random.uniform(0.5, 1.5, n)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    energy = 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass, high = float(au.kick[k]), float(au.bass[k]), float(au.high[k])
+        energy = max(energy * 0.8, kick)
+        base = np.where((a > tau)[label][:, :, None], img2, img1)
+        mag = intensity * 1.8 * energy * env * (0.4 + bass)
+        dxc = (vec[:, 0] * scale * mag).astype(np.float32)
+        dyc = (vec[:, 1] * scale * mag).astype(np.float32)
+        out = cv2.remap(base, xs - dxc[label], ys - dyc[label], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        ls = float(np.clip(env * (0.25 + 0.75 * high), 0, 1)) * 0.85
+        out[edges] = (out[edges] * (1 - ls)).astype(np.uint8)
+        yield out
+
+def luma_crush_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Luma-key brutalista: img2 sostituisce img1 a partire dalle zone scure, con bordo dithering
+    Bayer. Sui colpi l'immagine viene POSTERIZZATA fino a 2 livelli, i canali si permutano
+    (colori falsi) e gli acuti aggiungono rumore."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    bayer = np.array([[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+                      [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+                      [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+                      [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]], dtype=np.float32) / 64.0
+    tile = np.tile(bayer, (h // 8 + 1, w // 8 + 1))[:h, :w]
+    lum1 = (img1.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)) / 255.0
+    key = np.clip(lum1 * 0.85 + 0.15 * tile, 0, 1)
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    perms = [(2, 0, 1), (1, 2, 0), (2, 1, 0), (0, 2, 1)]
+    perm, prev, ws = None, 0.0, 0.2
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, high = float(au.kick[k]), float(au.high[k])
+        m = np.clip((a - key * (1 - ws)) / ws, 0, 1)[:, :, None]
+        frame = f1 * (1 - m) + f2 * m
+        crush = float(np.clip(env * (0.25 + 0.75 * kick), 0, 1))
+        q = 256.0 / max(2, int(round(12 - 10 * crush)))
+        crushed = np.floor(frame / q) * q + q / 2
+        if kick > 0.6 and prev <= 0.6:
+            perm = random.choice(perms)
+        elif kick <= 0.45:
+            perm = None
+        prev = kick
+        if perm is not None:
+            crushed = crushed[..., list(perm)]
+        crushed = crushed + (np.random.random((h, w, 1)).astype(np.float32) - 0.5) * 60.0 * high * env
+        mix = float(np.clip(env * (0.3 + 0.7 * kick), 0, 1))
+        yield np.clip(frame * (1 - mix) + crushed * mix, 0, 255).astype(np.uint8)
+
+AUDIO_EFFECTS = {"Spectrum Reveal", "Kick Zoom", "Flow Smear", "Block Shuffle", "Slit Scan", "Feedback Tunnel",
+                 "Pixel Sort", "Shockwave", "Kaleido Pulse", "Time Slice", "Shatter", "Luma Crush"}
 
 # ── Combo: UNA curva alpha globale tagliata in fette → continuità + frame esatti ──
 def _combo(funcs, img1, img2, num_frames, intensity, easing, alphas):
@@ -535,6 +726,12 @@ effect_funcs = {
     "Block Shuffle": block_shuffle_effect,
     "Slit Scan": slit_scan_effect,
     "Feedback Tunnel": feedback_tunnel_effect,
+    "Pixel Sort": pixel_sort_effect,
+    "Shockwave": shockwave_effect,
+    "Kaleido Pulse": kaleido_pulse_effect,
+    "Time Slice": time_slice_effect,
+    "Shatter": shatter_effect,
+    "Luma Crush": luma_crush_effect,
     "Combo Creative 1": combo_effect_preset1,
     "Combo Creative 2": combo_effect_preset2,
     "Combo Creative 3": combo_effect_preset3,
@@ -566,6 +763,12 @@ effect_descriptions = {
     "Block Shuffle": "Audio-reactive macroblock corruption: blocks displace and invert on every hit, bass widens the offset.",
     "Slit Scan": "Audio-reactive wavefront sweep: mids move the wave, bass swells it, volume pulls pixels along the front.",
     "Feedback Tunnel": "Audio-reactive video feedback: zoom, rotation and hue drift recirculate, kick triggers a flash.",
+    "Pixel Sort": "Audio-reactive pixel sorting: kick sets how many rows get sorted, bass the segment length, strong hits flip the direction.",
+    "Shockwave": "Audio-reactive shockwaves: every kick spawns an expanding ring that bends the image like water, with RGB refraction.",
+    "Kaleido Pulse": "Audio-reactive kaleidoscope: the segment count changes on every hit, mids rotate it, bass dilates it.",
+    "Time Slice": "Audio-reactive time slicing: each of 32 bands pulls from a past frame as old as its frequency energy.",
+    "Shatter": "Audio-reactive shatter: the image breaks into Voronoi shards that are blasted outward on every kick.",
+    "Luma Crush": "Audio-reactive luma-key with Bayer dithering: hits posterize the image, swap color channels and add noise.",
     "Combo Creative 1": "Glitch + Pixelate in sequence (continuous alpha curve).",
     "Combo Creative 2": "Wave Distort + Color Echo + Particle Float in sequence.",
     "Combo Creative 3": "Motion Blur + Film Look + Zoom Random in sequence.",
@@ -588,6 +791,16 @@ def resize_crop_fill(img, target_w, target_h):
         y0 = (h - new_h) // 2
         img = img[y0:y0 + new_h, :]
     return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+def load_image_fit(file, target_w, target_h):
+    """Apre UNA foto, la decodifica già ridotta (JPEG draft 1/2, 1/4, 1/8), applica l'orientamento EXIF
+    e la porta al formato scelto. Il picco di RAM è quello di una sola foto, non di tutte insieme."""
+    with Image.open(file) as im:
+        side = max(target_w, target_h)          # quadrato: sicuro anche per foto ruotate dall'EXIF
+        im.draft("RGB", (side, side))
+        im = ImageOps.exif_transpose(im)
+        arr = np.array(im.convert("RGB"))
+    return resize_crop_fill(arr, target_w, target_h)
 
 # ─────────────────────────────────────────────
 # UTILITY: SEQUENZA IMMAGINI (ciclica o ping-pong)
@@ -672,14 +885,53 @@ def repeat_pattern_to_length(pattern, target_frames, min_frames=4):
 # ─────────────────────────────────────────────
 # AUDIO: ANALISI + MUX
 # ─────────────────────────────────────────────
-def extract_audio_features(y, sr, fps, n_bands=N_BANDS):
-    """RMS, onset, bassi/medi/alti e spettro a 32 bande, normalizzati 0..1 e ricampionati
+def load_audio_streaming(path, target_sr=22050, block_seconds=30):
+    """Decodifica a blocchi (mono, 22.05 kHz): la RAM è ~0.09 MB per secondo di brano, mentre
+    librosa.load tiene l'intero file decodificato stereo a piena frequenza (~0.7 MB/s in transitorio)."""
+    try:
+        import soundfile as sf
+        import soxr
+        with sf.SoundFile(path) as f:
+            sr_in = f.samplerate
+            rs = soxr.ResampleStream(sr_in, target_sr, 1, dtype="float32") if sr_in != target_sr else None
+            out = []
+            for block in f.blocks(blocksize=int(block_seconds * sr_in), dtype="float32", always_2d=True):
+                mono = np.ascontiguousarray(block.mean(axis=1), dtype=np.float32)
+                out.append(rs.resample_chunk(mono) if rs else mono)
+            if rs:
+                out.append(rs.resample_chunk(np.zeros(0, dtype=np.float32), last=True))
+        return np.concatenate(out), target_sr
+    except Exception:
+        import librosa  # formati/versioni non gestiti da soundfile: percorso classico
+        return librosa.load(path, sr=target_sr, mono=True)
+
+def _spectral_pass(y, sr, hop=512, seg_seconds=60):
+    """STFT a blocchi da ~60 s → rms, mel a 128 bande (beat) e mel a 32 bande (feature).
+    La RAM resta piatta qualunque sia la durata del brano (a blocco unico cresceva ~1 MB/s di audio)."""
+    import librosa
+    seg = (int(seg_seconds * sr) // hop) * hop
+    ctx = 2048  # campioni di contesto ai lati di ogni blocco: i frame ai bordi restano identici a quelli continui
+    rms_l, m128_l, m32_l = [], [], []
+    for start in range(0, len(y), seg):
+        lo, hi = max(0, start - ctx), min(len(y), start + seg + ctx)
+        S = np.abs(librosa.stft(y[lo:hi], n_fft=2048, hop_length=hop))
+        skip = (start - lo) // hop  # frame di contesto da scartare a sinistra
+        S = S[:, skip:] if start + seg >= len(y) else S[:, skip:skip + seg // hop]
+        P = S ** 2
+        rms_l.append(librosa.feature.rms(S=S, frame_length=2048, hop_length=hop)[0])
+        m128_l.append(librosa.power_to_db(librosa.feature.melspectrogram(S=P, sr=sr, n_mels=128), top_db=None))
+        m32_l.append(librosa.power_to_db(
+            librosa.feature.melspectrogram(S=P, sr=sr, n_mels=N_BANDS, fmax=min(16000.0, sr / 2.0)), top_db=None))
+    m128, m32 = np.concatenate(m128_l, axis=1), np.concatenate(m32_l, axis=1)
+    return np.concatenate(rms_l), np.maximum(m128, m128.max() - 80.0), np.maximum(m32, m32.max() - 60.0)
+
+def extract_audio_features(rms, mel_db, sr, hop, duration, fps, n_bands=N_BANDS):
+    """RMS, onset, kick, bassi/medi/alti e spettro a 32 bande, normalizzati 0..1 e ricampionati
     sull'asse dei frame video (centro di ogni frame) con attacco rapido / rilascio lento."""
     import librosa
-    hop = 512
-    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-    t_stft = librosa.frames_to_time(np.arange(S.shape[1]), sr=sr, hop_length=hop)
-    n_video = int(np.ceil(len(y) / sr * fps)) + 2
+    T = mel_db.shape[1]
+    t_stft = np.arange(T) * hop / sr
+    n_video = int(np.ceil(duration * fps)) + 2
     t_video = (np.arange(n_video) + 0.5) / fps
 
     def norm(x, lo=5, hi=99):
@@ -689,16 +941,14 @@ def extract_audio_features(y, sr, fps, n_bands=N_BANDS):
     def to_video(x):
         return np.interp(t_video, t_stft, x)
 
-    rms = norm(librosa.feature.rms(S=S, frame_length=2048, hop_length=hop)[0])
-    mel = librosa.feature.melspectrogram(S=S ** 2, sr=sr, n_mels=n_bands, fmax=min(16000.0, sr / 2.0))
-    mel_db = librosa.power_to_db(mel, ref=np.max, top_db=60)
-    bands = np.stack([norm(mel_db[b]) for b in range(n_bands)], axis=1)
-    onset = librosa.onset.onset_strength(S=mel_db, sr=sr, hop_length=hop)
-    onset = np.pad(onset, (0, max(0, S.shape[1] - len(onset))))[:S.shape[1]]
-    q = n_bands // 8
-    kick = librosa.onset.onset_strength(S=mel_db[:q], sr=sr, hop_length=hop)  # solo bassi → i colpi di cassa
-    kick = np.pad(kick, (0, max(0, S.shape[1] - len(kick))))[:S.shape[1]]
+    def fit(x):
+        return np.pad(x, (0, max(0, T - len(x))))[:T]
 
+    rms = norm(rms)
+    bands = np.stack([norm(mel_db[b]) for b in range(n_bands)], axis=1)
+    onset = fit(librosa.onset.onset_strength(S=mel_db, sr=sr, hop_length=hop))
+    q = n_bands // 8
+    kick = fit(librosa.onset.onset_strength(S=mel_db[:q], sr=sr, hop_length=hop))  # solo bassi → colpi di cassa
     bass_t, mid_t, high_t = bands[:, :q].mean(1), bands[:, q:n_bands // 2].mean(1), bands[:, n_bands // 2:].mean(1)
     bands_v = np.stack([to_video(bands[:, b]) for b in range(n_bands)], axis=1)
     return AudioFeatures(
@@ -713,11 +963,23 @@ def extract_audio_features(y, sr, fps, n_bands=N_BANDS):
 
 def analyze_audio(audio_path, grid_mode, fps=24):
     import librosa
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    bpm = float(np.atleast_1d(tempo)[0])  # librosa >= 0.10 restituisce array
-    bt = np.asarray(librosa.frames_to_time(beat_frames, sr=sr), dtype=np.float64)
+    hop = 512
+    y, sr = load_audio_streaming(audio_path, 22050)
     duration = len(y) / sr
+    rms, mel128, mel32 = _spectral_pass(y, sr, hop)
+    del y  # il segnale non serve più: da qui lavoriamo su matrici piccole
+    # stessa envelope che beat_track(y=...) calcolerebbe internamente (mel 128, mediana)
+    onset_env = librosa.onset.onset_strength(S=mel128, sr=sr, hop_length=hop, aggregate=np.median)
+    max_tempo_frames = int(300 * sr / hop)  # 5 minuti
+    if len(onset_env) > max_tempo_frames:
+        mid = len(onset_env) // 2
+        excerpt = onset_env[mid - max_tempo_frames // 2: mid + max_tempo_frames // 2]
+        bpm_est = float(np.atleast_1d(librosa.feature.tempo(onset_envelope=excerpt, sr=sr, hop_length=hop))[0])
+        tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop, bpm=bpm_est)
+    else:
+        tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop)
+    bpm = float(np.atleast_1d(tempo)[0])  # librosa >= 0.10 restituisce array
+    bt = np.asarray(librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop), dtype=np.float64)
     n_detected = len(bt)
     if len(bt) == 0 or bt[0] > 0.05:
         bt = np.insert(bt, 0, 0.0)
@@ -725,7 +987,7 @@ def analyze_audio(audio_path, grid_mode, fps=24):
         bt = np.append(bt, duration)
     bt = adjust_beat_grid(bt, grid_mode)
     try:
-        features = extract_audio_features(y, sr, fps)
+        features = extract_audio_features(rms, mel32, sr, hop, duration, fps)
     except Exception:
         features = None  # il beat-sync funziona comunque; gli effetti audio usano il ritmo sintetico
     return bpm, bt, duration, n_detected, features
@@ -748,15 +1010,35 @@ def mux_audio(video_path, audio_path):
         return muxed, None
     return None, (result.stderr or "")[-300:]
 
+def make_preview_proxy(video_path, max_side=480):
+    """Copia a bassa risoluzione e bitrate del video finale (audio incluso), solo per guardarlo nel
+    browser prima di scaricarlo. Il file da scaricare resta in piena qualità."""
+    out = video_path.replace(".mp4", "_proxy.mp4")
+    vf = (f"scale=w={max_side}:h={max_side}:force_original_aspect_ratio=decrease,"
+          "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+    cmd = [get_ffmpeg_path(), "-y", "-i", video_path, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(out):
+            with open(out, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    finally:
+        _safe_remove(out)
+    return None
+
 # ─────────────────────────────────────────────
 # RENDER IN STREAMING
 # ─────────────────────────────────────────────
 def build_video(images, image_sequence, frame_counts, effect_choice, intensity, easing,
-                ffmpeg_preset, fps, rnd, on_progress=None, features=None):
+                ffmpeg_preset, fps, rnd, on_progress=None, features=None, quality=8, macro_block_size=16):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         video_path = tmp.name
-    writer = imageio.get_writer(video_path, fps=fps, codec="libx264", quality=8,
-                                output_params=["-preset", ffmpeg_preset])
+    writer = imageio.get_writer(video_path, fps=fps, codec="libx264", quality=quality,
+                                macro_block_size=macro_block_size, output_params=["-preset", ffmpeg_preset])
     mixed_used, written, cursor = [], 0, 0
     if features is None:  # senza brano: ritmo sintetico, ma deterministico (seed)
         features = AudioFeatures.synthetic(sum(frame_counts), fps, rnd)
@@ -841,7 +1123,8 @@ def generate_report(p: dict) -> str:
 # ─────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────
-STATE_KEYS = ["video_bytes", "audio_bytes", "audio_name", "report_text", "video_ready"]
+STATE_KEYS = ["video_bytes", "audio_bytes", "audio_name", "report_text", "video_ready",
+              "preview_proxy", "preview_width"]
 for key in STATE_KEYS:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -857,10 +1140,20 @@ col1, col2 = st.columns([2, 1])
 
 with col1:
     uploaded_files = st.file_uploader(
-        "Carica almeno 2 (massimo 10) immagini",
+        f"Carica da 2 a {MAX_IMAGES} immagini (max {MAX_UPLOAD_MB} MB in totale)",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True
     )
+    n_up = len(uploaded_files) if uploaded_files else 0
+    total_mb = sum(f.size for f in uploaded_files) / 1e6 if uploaded_files else 0.0
+    upload_ok = 2 <= n_up <= MAX_IMAGES and total_mb <= MAX_UPLOAD_MB
+    if n_up:
+        st.caption(f"🧮 {n_up} / {MAX_IMAGES} immagini · {total_mb:.0f} / {MAX_UPLOAD_MB} MB")
+        if n_up > MAX_IMAGES:
+            st.error(f"Troppe immagini: il massimo è {MAX_IMAGES}. Rimuovine {n_up - MAX_IMAGES}.")
+        elif total_mb > MAX_UPLOAD_MB:
+            st.error(f"Peso totale {total_mb:.0f} MB sopra il limite di {MAX_UPLOAD_MB} MB: l'app rischia di "
+                     f"andare in crash. Togli qualche foto o usa versioni più leggere.")
 
 with col2:
     effect_choice = st.selectbox("Effetto", list(effect_funcs.keys()) + [MIXED_LABEL])
@@ -905,40 +1198,58 @@ with col4:
     ffmpeg_preset = {"⚖️ Bilanciato": "medium", "⚡ Velocità (file leggermente più pesante)": "veryfast",
                      "🎯 Qualità (più lento)": "slow"}[speed_label]
 
+if n_up >= 2 and not (use_music and audio_file is not None):
+    min_s = (n_up - 1) * 4 / 24
+    if duration < min_s:
+        st.info(f"ℹ️ Con {n_up} immagini ogni transizione dura almeno 4 frame: il video durerà circa "
+                f"{min_s:.1f} s invece di {duration} s. Per una durata più breve usa meno immagini.")
+
 # ─────────────────────────────────────────────
 # ANTEPRIMA RAPIDA
 # ─────────────────────────────────────────────
-preview_btn = st.button("🔍 Anteprima rapida (prime 2 immagini, bassa risoluzione)")
+prev_cols = st.columns([3, 2])
+with prev_cols[0]:
+    preview_btn = st.button("🔍 Anteprima rapida (bassa risoluzione)")
+with prev_cols[1]:
+    prev_n = st.radio("Immagini in anteprima", [4, 8], horizontal=True)
 
 if preview_btn:
-    if not uploaded_files or len(uploaded_files) < 2:
+    if n_up < 2:
         st.warning("⚠️ Carica almeno 2 immagini per l'anteprima.")
     else:
-        with st.spinner("Genero anteprima..."):
+        n_prev = min(prev_n, n_up)
+        with st.spinner(f"Genero anteprima con {n_prev} immagini..."):
             if seed_input:
                 random.seed(int(seed_input))
                 np.random.seed(int(seed_input))
-            prev_size = (320, 320) if format_choice == "1:1" else ((480, 270) if format_choice == "16:9" else (270, 480))
-            im1 = resize_crop_fill(np.array(Image.open(uploaded_files[0]).convert("RGB")), *prev_size)
-            im2 = resize_crop_fill(np.array(Image.open(uploaded_files[1]).convert("RGB")), *prev_size)
-            eff_name = pick_effect_for_transition(effect_choice, random.Random(int(seed_input) or None))
-            prev_path = os.path.join(tempfile.gettempdir(), "ftf_preview.mp4")
-            writer_p = imageio.get_writer(prev_path, fps=12, codec="libx264", quality=6,
-                                          macro_block_size=None, output_params=["-preset", "ultrafast"])
-            try:
-                for fr in effect_funcs[eff_name](im1, im2, 24, intensity, easing_choice):
-                    writer_p.append_data(fr)
-            finally:
-                writer_p.close()
-            st.caption(f"Effetto usato: **{eff_name}**")
-            st.video(prev_path)
+            prev_size = {"1:1": (240, 240), "16:9": (320, 180), "9:16": (180, 320)}[format_choice]
+            prev_fps, prev_frames = 12, 18  # 1,5 s per transizione
+            imgs_p = [load_image_fit(f, *prev_size) for f in uploaded_files[:n_prev]]
+            counts_p = [prev_frames] * (n_prev - 1)
+            path_p, written_p, mixed_p = build_video(
+                imgs_p, list(range(n_prev)), counts_p, effect_choice, intensity, easing_choice,
+                "ultrafast", prev_fps, random.Random(int(seed_input) or None), None, None, 5, None)
+            with open(path_p, "rb") as f:
+                data_p = f.read()
+            _safe_remove(path_p)
+            used = ", ".join(sorted(set(mixed_p))) if mixed_p else effect_choice
+            note = "" if n_prev == prev_n else f" (ne hai caricate solo {n_up})"
+            st.session_state["preview_quick"] = {
+                "bytes": data_p, "width": prev_size[0],
+                "caption": f"{n_prev} immagini{note} · {len(counts_p)} transizioni · {written_p / prev_fps:.1f} s · "
+                           f"{prev_size[0]}×{prev_size[1]} · effetto: {used}"}
+
+quick = st.session_state.get("preview_quick")
+if quick:
+    st.caption(quick["caption"])
+    st.video(quick["bytes"], format="video/mp4", width=quick["width"])
 
 # ─────────────────────────────────────────────
 # GENERAZIONE
 # ─────────────────────────────────────────────
 video_btn = st.button("🎬 Genera Video")
 
-if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
+if video_btn and upload_ok:
 
     format_dims = {"1:1": (720, 720), "16:9": (1280, 720), "9:16": (720, 1280)}
     target_size = format_dims[format_choice]
@@ -953,8 +1264,7 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     np.random.seed(seed_used)
     rnd = random.Random(seed_used)
 
-    images = [np.array(Image.open(f).convert("RGB")) for f in uploaded_files]
-    images = [resize_crop_fill(img, *target_size) for img in images]
+    images = [load_image_fit(f, *target_size) for f in uploaded_files]  # una per volta: RAM piatta
     image_sequence = build_image_sequence(len(images), loop_mode)
     num_transitions = len(images) - 1
 
@@ -1027,6 +1337,9 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
 
     with open(final_video_path, "rb") as f:
         st.session_state["video_bytes"] = f.read()
+    status.text("Creo l'anteprima a bassa risoluzione...")
+    st.session_state["preview_proxy"] = make_preview_proxy(final_video_path)
+    st.session_state["preview_width"] = {"1:1": 400, "16:9": 520, "9:16": 280}[format_choice]
     _safe_remove(video_path, muxed_path, tmp_audio_path)
 
     w, h = target_size
@@ -1051,13 +1364,23 @@ if video_btn and uploaded_files and 2 <= len(uploaded_files) <= 10:
     st.success(f"✅ Video generato con successo! (seed {seed_used})")
 
 elif video_btn:
-    st.warning("⚠️ Carica tra 2 e 10 immagini prima di generare.")
+    if n_up < 2:
+        st.warning("⚠️ Carica almeno 2 immagini prima di generare.")
+    else:
+        st.warning(f"⚠️ Limiti da rispettare: massimo {MAX_IMAGES} immagini e {MAX_UPLOAD_MB} MB in totale "
+                   f"(ora: {n_up} immagini, {total_mb:.0f} MB).")
 
 # ─────────────────────────────────────────────
 # DOWNLOAD — sempre visibili dopo la generazione (FUORI da st.button → non si resettano al rerun)
 # ─────────────────────────────────────────────
 if st.session_state.get("video_ready"):
     st.divider()
+    st.subheader("▶️ Anteprima del video (bassa risoluzione)")
+    if st.session_state.get("preview_proxy"):
+        st.video(st.session_state["preview_proxy"], format="video/mp4", width=st.session_state["preview_width"])
+        st.caption("Copia compressa solo per guardarlo qui, con l'audio: il file scaricato è in piena qualità.")
+    else:
+        st.caption("Anteprima non disponibile: scarica il video per vederlo.")
     has_audio = st.session_state.get("audio_bytes") is not None
     # numero di colonne SEMPRE fisso (3): evita il crash "removeChild" del frontend Streamlit
     dl_cols = st.columns(3)
