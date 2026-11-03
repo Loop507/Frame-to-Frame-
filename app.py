@@ -15,6 +15,15 @@ st.set_page_config(page_title="🎞️ Frame-to-Frame FX Video Generator 3.1 by 
 MAX_IMAGES = 40
 MAX_UPLOAD_MB = 150
 
+# Qualità del video finale: (CRF x264, tetto di bitrate in Mbps). Misurato su 720p: il vecchio default
+# (quality=8 di imageio = CRF 10) dava ~55 MB ogni 30 s con immagini lisce e fino a ~190 MB con immagini
+# molto granulose. CRF + tetto tengono il file sotto controllo anche con effetti "rumorosi".
+QUALITY_PRESETS = {
+    "📦 Leggero (~9 MB ogni 30 s)": (26, 3.5),
+    "⚖️ Bilanciato (~12 MB ogni 30 s)": (22, 6.0),
+    "💎 Alta (~17 MB ogni 30 s)": (18, 12.0),
+}
+
 # ─────────────────────────────────────────────
 # ALPHA / EASING
 # Gli alpha vanno da 0 (incluso) a 1 (ESCLUSO): l'ultimo frame di una transizione
@@ -43,6 +52,9 @@ def _blend(img1, img2, a):
 def _env(a):
     """Inviluppo 0→1→0 sulla transizione: gli effetti 'a impulso' partono e finiscono a riposo."""
     return float(np.sin(np.pi * a))
+
+def _grid(h, w):
+    return np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
 
 # ─────────────────────────────────────────────
 # AUDIO FEATURES — una riga per frame video (allineate al brano, 0..1)
@@ -104,90 +116,176 @@ def _au(audio, n):
 # EFFETTI — tutti generatori (yield): un frame alla volta, niente liste in RAM.
 # Firma comune: (img1, img2, num_frames, intensity, easing, alphas=None)
 # ─────────────────────────────────────────────
-def fade_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    f1 = img1.astype(np.float32)
-    f2 = img2.astype(np.float32)
-    for a in _alphas(num_frames, easing, alphas):
-        yield (f1 * (1 - a) + f2 * a).astype(np.uint8)
-
-def morph_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Morph vero con optical flow Farneback (DSP puro): i pixel di img1 scivolano verso
-    img2 e viceversa, poi crossfade. Il flusso si calcola UNA volta a metà risoluzione."""
+def fade_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Dissolvenza a canali sfalsati: R segue i bassi, G i medi, B gli alti (ognuno anticipa o ritarda
+    il proprio crossfade → il colore 'respira' con la musica). Ogni kick accende un bagliore (bloom)."""
     h, w = img1.shape[:2]
-    scale = 0.5 if max(h, w) > 480 else 1.0
-    sw, sh = max(8, int(w * scale)), max(8, int(h * scale))
-    g1 = cv2.cvtColor(cv2.resize(img1, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
-    g2 = cv2.cvtColor(cv2.resize(img2, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY)
-    params = dict(pyr_scale=0.5, levels=4, winsize=21, iterations=3, poly_n=5, poly_sigma=1.1, flags=0)
-    flow12 = cv2.calcOpticalFlowFarneback(g1, g2, None, **params)
-    flow21 = cv2.calcOpticalFlowFarneback(g2, g1, None, **params)
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    spread = 0.25 + intensity / 60.0
+    for k, a in enumerate(al):
+        env, kick = _env(a), float(au.kick[k])
+        e = np.array([au.bass[k], au.mid[k], au.high[k]], dtype=np.float32)
+        ac = np.clip(a + spread * env * (e - 0.5) * 2.0, 0, 1).astype(np.float32)
+        out = (f1 * (1 - ac) + f2 * ac) * (1.0 + 0.15 * kick * env)
+        glow_amt = float(kick * env)
+        if glow_amt > 0.1:
+            g = cv2.GaussianBlur(cv2.resize(out, (max(1, w // 4), max(1, h // 4))), (0, 0), 5)
+            out = out + cv2.resize(g, (w, h)) * (0.40 * glow_amt)
+        yield np.clip(out, 0, 255).astype(np.uint8)
 
-    def _up(flow):
-        flow = cv2.GaussianBlur(flow, (0, 0), 3)
-        return cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) / scale
-
-    f12, f21 = _up(flow12), _up(flow21)
-    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    for a in _alphas(num_frames, easing, alphas):
-        w1 = cv2.remap(img1, xs - a * f12[..., 0], ys - a * f12[..., 1],
-                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        w2 = cv2.remap(img2, xs - (1 - a) * f21[..., 0], ys - (1 - a) * f21[..., 1],
-                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+def morph_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Morph elastico a optical flow: il kick spinge (e a volte ritira) il movimento dei pixel come una
+    molla, e gli acuti sfalsano la deformazione dei tre canali colore → scia cromatica lungo il flusso."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    f12, f21 = _flow_full(img1, img2), _flow_full(img2, img1)
+    xs, ys = _grid(h, w)
+    ch1, ch2 = cv2.split(img1), cv2.split(img2)
+    for k, a in enumerate(al):
+        env, kick, high = _env(a), float(au.kick[k]), float(au.high[k])
+        push = 0.30 * (kick - 0.25) * env
+        p1, p2 = a + push, (1 - a) - push
+        scales = (1.0 + 0.20 * high * env, 1.0, 1.0 - 0.20 * high * env)
+        w1 = cv2.merge([cv2.remap(c, xs - p1 * s * f12[..., 0], ys - p1 * s * f12[..., 1],
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) for c, s in zip(ch1, scales)])
+        w2 = cv2.merge([cv2.remap(c, xs - p2 * s * f21[..., 0], ys - p2 * s * f21[..., 1],
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) for c, s in zip(ch2, scales)])
         yield _blend(w1, w2, a)
 
-def glitch_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def glitch_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Glitch a strappi persistenti: ogni colpo fa nascere fasce orizzontali che restano 'incastrate'
+    per qualche frame, scorrono di lato (ampiezza dai bassi), si dividono in RGB (acuti) e in parte
+    mostrano l'ALTRA immagine. Tra un colpo e l'altro, micro-tremore di riga."""
     h, w = img1.shape[:2]
-    for a in _alphas(num_frames, easing, alphas):
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    amp = intensity / 15.0
+    slices, prev = [], 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        hit, bass, high = float(au.onset[k]), float(au.bass[k]), float(au.high[k])
+        remaining = len(al) - k - 2
+        if hit > 0.4 and prev <= 0.4 and remaining > 0:
+            for _ in range(int(round((2 + 10 * hit) * amp * env))):
+                slices.append({"y": random.randint(0, max(0, h - 8)), "h": random.randint(4, max(5, int(h * 0.07))),
+                               "dx": int(random.choice((-1, 1)) * random.uniform(0.02, 0.25) * w * (0.3 + bass)),
+                               "ttl": min(random.randint(2, 7), remaining), "swap": random.random() < 0.4,
+                               "split": int(2 + high * 20 * amp)})
+            slices = slices[-30:]
+        prev = hit
         frame = _blend(img1, img2, a)
-        for _ in range(intensity):
-            y = random.randint(0, h - 2)
-            frame[y:y+2, :, :] = np.roll(frame[y:y+2, :, :], random.randint(-intensity, intensity), axis=1)
+        other = img2 if a < 0.5 else img1
+        for s in slices:
+            y0, y1 = s["y"], min(h, s["y"] + s["h"])
+            src = np.roll((other if s["swap"] else frame)[y0:y1], s["dx"], axis=1)
+            src[..., 0] = np.roll(src[..., 0], s["split"], axis=1)
+            src[..., 2] = np.roll(src[..., 2], -s["split"], axis=1)
+            frame[y0:y1] = src
+            s["ttl"] -= 1
+        slices = [s for s in slices if s["ttl"] > 0]
+        reach = int(10 * amp) + 1
+        for _ in range(int(env * (2 + 10 * high) * amp)):
+            y = random.randint(0, h - 3)
+            frame[y:y + 2] = np.roll(frame[y:y + 2], random.randint(-reach, reach), axis=1)
         yield frame
 
-def pixelate_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def pixelate_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Mosaico che respira: la dimensione dei pixel pulsa col kick e coi bassi, i colori vengono ridotti
+    a una palette povera (più povera sui colpi) e sui colpi forti una parte dei blocchi si inverte."""
     h, w = img1.shape[:2]
-    for a in _alphas(num_frames, easing, alphas):
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    amp = min(1.0, intensity / 12.0 + 0.3)
+    for k, a in enumerate(al):
+        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
         frame = _blend(img1, img2, a)
-        scale = random.randint(4, 10)
-        small = cv2.resize(frame, (max(1, w // scale), max(1, h // scale)), interpolation=cv2.INTER_LINEAR)
-        yield cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-
-def corrupt_lines_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    h, w = img1.shape[:2]
-    for a in _alphas(num_frames, easing, alphas):
-        frame = _blend(img1, img2, a)
-        for _ in range(intensity):
-            x = random.randint(0, w - 15)
-            y = random.randint(0, h - 1)
-            width = random.randint(5, 15)
-            frame[y:y+1, x:x+width] = np.random.randint(0, 255, (1, width, 3), dtype=np.uint8)
+        pulse = max(kick, 0.2 + 0.4 * rms)
+        bs = int(1 + (4 + 56 * pulse * (0.5 + 0.5 * bass)) * env * amp)
+        if bs > 1:
+            small = cv2.resize(frame, (max(1, w // bs), max(1, h // bs)), interpolation=cv2.INTER_AREA)
+            q = 256.0 / max(3, int(round(14 - 10 * pulse * env)))
+            sm = np.floor(small.astype(np.float32) / q) * q + q / 2
+            if kick > 0.55:
+                inv = np.random.random(sm.shape[:2]) < (0.06 + 0.2 * (kick - 0.55))
+                sm[inv] = 255 - sm[inv]
+            frame = cv2.resize(np.clip(sm, 0, 255).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
         yield frame
 
-def wave_distort_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def corrupt_lines_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Databending: pixel dell'immagine vengono 'allungati' in strisce orizzontali e verticali (come un
+    buffer corrotto). Il kick decide quante strisce, i bassi quanto sono lunghe; gli acuti aprono
+    blocchi di rumore binario."""
     h, w = img1.shape[:2]
-    # offset funzione della sola riga → righe con lo stesso offset si ruotano insieme in un colpo
-    y_idx = np.arange(h)
-    offsets = (intensity * np.sin(2 * np.pi * y_idx / 50)).astype(np.int64)
-    groups = [(int(v), np.where(offsets == v)[0]) for v in np.unique(offsets)]
-    for a in _alphas(num_frames, easing, alphas):
-        blend = _blend(img1, img2, a)
-        distorted = np.empty_like(blend)
-        for v, rows in groups:
-            distorted[rows] = np.roll(blend[rows], v, axis=1)
-        yield distorted
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    amp = intensity / 15.0
+    for k, a in enumerate(al):
+        env, kick, bass, high = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.high[k])
+        frame = _blend(img1, img2, a)
+        for _ in range(int((30 + 300 * kick) * env * amp)):
+            x, y = random.randint(0, w - 1), random.randint(0, h - 1)
+            col = (int(frame[y, x, 0]), int(frame[y, x, 1]), int(frame[y, x, 2]))
+            length = int(random.uniform(0.02, 0.35) * w * (0.3 + bass))
+            th = random.randint(2, 7)
+            if random.random() < 0.75:
+                cv2.line(frame, (x, y), (min(w - 1, x + length), y), col, th)
+            else:
+                cv2.line(frame, (x, y), (x, min(h - 1, y + int(length * h / w))), col, th)
+        for _ in range(int(env * (1 + 8 * high) * amp)):
+            bw, bh = random.randint(20, 200), random.randint(2, 12)
+            x, y = random.randint(0, max(0, w - bw)), random.randint(0, max(0, h - bh))
+            frame[y:y + bh, x:x + bw] = np.random.randint(0, 256, (min(bh, h - y), min(bw, w - x), 3), dtype=np.uint8)
+        yield frame
 
-def zoom_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Punch-in: lo zoom sale e RIENTRA a 1× a fine transizione (nessun 'pop' alla giunzione)."""
+def wave_distort_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Liquido: onde sinusoidali su entrambi gli assi. L'ampiezza segue bassi e kick, la lunghezza
+    d'onda i medi, la velocità gli acuti; i tre canali colore ondeggiano con ampiezze diverse
+    (aberrazione liquida)."""
     h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xs, ys = _grid(h, w)
+    y1d = np.arange(h, dtype=np.float32)[:, None]
+    x1d = np.arange(w, dtype=np.float32)[None, :]
+    p1 = p2 = 0.0
+    for k, a in enumerate(al):
+        env, kick, bass, mid, high = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.mid[k]), float(au.high[k])
+        p1 += 0.10 + 0.5 * high
+        p2 += 0.07 + 0.4 * mid
+        A = intensity * (0.6 + 2.2 * bass + 1.5 * kick) * env
+        dx = (A * np.sin(2 * np.pi * y1d / (h / (2 + 6 * mid)) + p1)).astype(np.float32)
+        dy = (0.6 * A * np.sin(2 * np.pi * x1d / (w / (2 + 5 * mid)) + p2)).astype(np.float32)
+        chans = [cv2.remap(c, xs - dx * f, ys - dy * f, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                 for c, f in zip(cv2.split(_blend(img1, img2, a)), (1.15, 1.0, 0.85))]
+        yield cv2.merge(chans)
+
+def zoom_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Zoom blur radiale: ad ogni kick l'inquadratura 'spara' verso il centro con strisce di velocità
+    (7 copie a zoom crescente fuse insieme), con una leggera rotazione guidata dai medi.
+    Rientra a 1× a fine transizione."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
     center = (w / 2.0, h / 2.0)
-    for a in _alphas(num_frames, easing, alphas):
-        zoom = 1.0 + (intensity / 100.0) * _env(a)
-        M = cv2.getRotationMatrix2D(center, 0, zoom)
-        z1 = cv2.warpAffine(img1, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-        z2 = cv2.warpAffine(img2, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-        yield _blend(z1, z2, a)
+    taps = 7
+    for k, a in enumerate(al):
+        env, kick, mid = _env(a), float(au.kick[k]), float(au.mid[k])
+        frame = _blend(img1, img2, a)
+        z = (intensity / 50.0) * env * (0.25 + 1.2 * kick)
+        ang = (mid - 0.5) * env * (intensity / 10.0)
+        acc = np.zeros(frame.shape, np.float32)
+        last = frame
+        for t in range(taps):
+            f = t / (taps - 1)
+            M = cv2.getRotationMatrix2D(center, ang * f, 1.0 + z * f)
+            last = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            acc += last
+        yield cv2.addWeighted((acc / taps).astype(np.uint8), 0.7, last, 0.3, 0)
 
-def zoom_random_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def zoom_random_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
     h, w = img1.shape[:2]
     for a in _alphas(num_frames, easing, alphas):
         zoom = 1.0 + random.uniform(0, intensity / 50.0) * _env(a)
@@ -198,122 +296,336 @@ def zoom_random_effect(img1, img2, num_frames, intensity, easing, alphas=None):
         z2 = cv2.warpAffine(img2, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
         yield _blend(z1, z2, a)
 
-def _mask_blend(img1, img2, alpha_map):
-    return (img1.astype(np.float32) * (1 - alpha_map) + img2.astype(np.float32) * alpha_map).astype(np.uint8)
-
-def wipe_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Wipe direzionale orizzontale (sinistra -> destra) con bordo sfumato."""
+def wipe_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Wipe a spettro: il fronte avanza da sinistra a destra, ma ogni riga lo sposta in base alla SUA
+    banda di frequenza (il bordo diventa un'onda che balla), il volume allarga la sfumatura e il
+    kick accende una linea luminosa lungo il fronte."""
     h, w = img1.shape[:2]
-    feather = max(4, int(intensity))
-    xs = np.arange(w)
-    for a in _alphas(num_frames, easing, alphas):
-        edge = -feather + a * (w + feather)
-        row = np.clip((edge - xs) / feather + 1, 0, 1).astype(np.float32)
-        yield _mask_blend(img1, img2, row[np.newaxis, :, np.newaxis])
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xs = np.arange(w, dtype=np.float32)[None, :]
+    ridx = (np.arange(h) * N_BANDS) // h
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    for k, a in enumerate(al):
+        env, kick, rms = _env(a), float(au.kick[k]), float(au.rms[k])
+        feather = max(4.0, intensity * (0.4 + rms))
+        e = au.bands[k][ridx].astype(np.float32)
+        edge = (-feather + a * (w + 2 * feather) + intensity * 6.0 * env * (e - 0.4) * (0.5 + rms)).astype(np.float32)[:, None]
+        m = np.clip((edge - xs) / feather + 1, 0, 1)[:, :, None]
+        glow = np.exp(-((xs - edge) / (feather * 0.7)) ** 2)[:, :, None] * ((0.35 + 0.65 * kick) * env * 160.0)
+        yield np.clip(f1 * (1 - m) + f2 * m + glow, 0, 255).astype(np.uint8)
 
-def diagonal_wipe_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Wipe diagonale (alto-sx -> basso-dx) con bordo sfumato."""
+def diagonal_wipe_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Persiane diagonali: 14 strisce che spazzano in versi alterni; ogni striscia ritarda in base
+    all'energia della propria banda di frequenza e il kick accende i bordi."""
     h, w = img1.shape[:2]
-    feather = max(8, int(intensity) * 2)
-    yy, xx = np.mgrid[0:h, 0:w]
-    diag = (xx + yy).astype(np.float32)
-    max_diag = w + h
-    for a in _alphas(num_frames, easing, alphas):
-        edge = -feather + a * (max_diag + feather)
-        yield _mask_blend(img1, img2, np.clip((edge - diag) / feather + 1, 0, 1)[:, :, np.newaxis])
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    n, soft, stag = 14, 0.10, 0.35
+    xx, yy = _grid(h, w)
+    s_idx = np.clip(((xx - yy + h) / (w + h) * n).astype(np.int32), 0, n - 1)
+    diag = (xx + yy) / (w + h)
+    dcoord = np.where(s_idx % 2 == 1, 1.0 - diag, diag).astype(np.float32)
+    band_pos = np.linspace(0, N_BANDS - 1, n)
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    for k, a in enumerate(al):
+        env, kick = _env(a), float(au.kick[k])
+        e = np.interp(band_pos, np.arange(N_BANDS), au.bands[k]).astype(np.float32)
+        o = stag * env * e
+        p = np.clip((a - o) / (1.0 - o), 0, 1).astype(np.float32)
+        m = np.clip((p[s_idx] * (1 + soft) - dcoord) / soft, 0, 1)
+        edge = (4.0 * m * (1.0 - m) * ((0.3 + 0.7 * kick) * env * 200.0))[:, :, None]
+        m3 = m[:, :, None]
+        yield np.clip(f1 * (1 - m3) + f2 * m3 + edge, 0, 255).astype(np.uint8)
 
-def iris_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Iris circolare che si espande dal centro con bordo sfumato."""
+def iris_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Iris a spettro: il bordo del cerchio ha un raggio diverso per ogni angolo (spettro specchiato
+    attorno al centro) → una stella/fiore che pulsa; il kick accende l'anello."""
     h, w = img1.shape[:2]
-    cy, cx = h / 2.0, w / 2.0
-    feather = max(4, int(intensity))
-    yy, xx = np.mgrid[0:h, 0:w]
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2).astype(np.float32)
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    cx, cy = w / 2.0, h / 2.0
+    xs, ys = _grid(h, w)
+    dx, dy = xs - cx, ys - cy
+    dist = np.sqrt(dx * dx + dy * dy)
+    u = np.abs((np.arctan2(dy, dx) + np.pi) / np.pi - 1.0)
+    idx = np.minimum((u * N_BANDS).astype(np.int32), N_BANDS - 1)
     max_r = float(np.sqrt(cx ** 2 + cy ** 2))
-    for a in _alphas(num_frames, easing, alphas):
-        radius = -feather + a * (max_r + feather)
-        yield _mask_blend(img1, img2, np.clip((radius - dist) / feather + 1, 0, 1)[:, :, np.newaxis])
+    feather = max(4.0, float(intensity))
+    amp = min(0.7, 0.2 + intensity / 50.0)
+    f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
+    for k, a in enumerate(al):
+        env, kick = _env(a), float(au.kick[k])
+        shape = (1.0 + amp * env * (au.bands[k].astype(np.float32) - 0.45) * 2.0).astype(np.float32)
+        R = (-feather + a * (max_r * 1.35 + feather)) * shape[idx]
+        m = np.clip((R - dist) / feather + 1, 0, 1)[:, :, None]
+        ring = np.exp(-((dist - R) / (feather * 0.8)) ** 2)[:, :, None] * ((0.3 + 0.7 * kick) * env * 180.0)
+        yield np.clip(f1 * (1 - m) + f2 * m + ring, 0, 255).astype(np.uint8)
 
-def color_echo_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    """Aberrazione cromatica: R e B scivolano in direzioni opposte (G fermo) e si ricompongono.
-    Lo scarto è un impulso (sin πa): a inizio/fine transizione i canali sono allineati."""
+def color_echo_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Eco cromatico nel TEMPO: R, G e B pescano da frame passati diversi (R ritarda coi bassi, G coi
+    medi, B con gli acuti) e scivolano di lato in verso opposto sui colpi. Un vero eco, non un alone."""
     h, w = img1.shape[:2]
-    max_shift = max(1.0, intensity * 0.6)
-    for a in _alphas(num_frames, easing, alphas):
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    hist = []
+    for k, a in enumerate(al):
+        env, kick = _env(a), float(au.kick[k])
+        hist = (hist + [_blend(img1, img2, a)])[-18:]
+        maxd = min(len(hist) - 1, int(3 + intensity / 4))
+        dR = int(round(float(au.bass[k]) * maxd * env))
+        dG = int(round(float(au.mid[k]) * maxd * env * 0.5))
+        dB = int(round(float(au.high[k]) * maxd * env))
+        sh = int(intensity * 0.4 * env * (0.3 + kick))
+        r, g, b = hist[-1 - dR][..., 0], hist[-1 - dG][..., 1], hist[-1 - dB][..., 2]
+        shr, shb = sh + dR * 4, sh + dB * 4
+        if shr:
+            r = np.roll(r, shr, axis=1)
+        if shb:
+            b = np.roll(b, -shb, axis=1)
+        yield cv2.merge([np.ascontiguousarray(r), np.ascontiguousarray(g), np.ascontiguousarray(b)])
+
+def particle_float_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Scintille: ogni kick fa esplodere uno sciame di particelle con scia, colorate dai pixel
+    dell'immagine sotto (schiariti). Il volume dà la velocità, i bassi lo spessore, i medi la
+    gravità; un alone sfocato le fa brillare."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    max_n, prev = 700, 0.0
+    pos, vel = np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+    ttl, col = np.zeros(0, np.int32), np.zeros((0, 3), np.uint8)
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, rms, bass, mid = float(au.kick[k]), float(au.rms[k]), float(au.bass[k]), float(au.mid[k])
         frame = _blend(img1, img2, a)
-        s = max_shift * _env(a)
+        remaining = len(al) - k - 1
+        if remaining > 2 and ((kick > 0.5 and prev <= 0.5) or random.random() < 0.15 * rms * env):
+            nb = max(4, int((40 + 240 * kick) * min(1.5, intensity / 15.0) * max(env, 0.25)))
+            c = np.array([random.uniform(0.1 * w, 0.9 * w), random.uniform(0.1 * h, 0.9 * h)], np.float32)
+            p = c + np.random.normal(0, 18, (nb, 2)).astype(np.float32)
+            ang = np.random.uniform(0, 2 * np.pi, nb).astype(np.float32)
+            spd = (np.random.uniform(3, 16, nb) * (0.5 + rms)).astype(np.float32)
+            v = np.stack([np.cos(ang), np.sin(ang)], 1) * spd[:, None]
+            px, py = np.clip(p[:, 0], 0, w - 1).astype(int), np.clip(p[:, 1], 0, h - 1).astype(int)
+            cl = np.clip(frame[py, px].astype(np.float32) * 1.5 + 60, 0, 255).astype(np.uint8)
+            t = np.minimum(np.random.randint(8, 22, nb), remaining).astype(np.int32)
+            pos, vel = np.concatenate([pos, p])[-max_n:], np.concatenate([vel, v])[-max_n:]
+            ttl, col = np.concatenate([ttl, t])[-max_n:], np.concatenate([col, cl])[-max_n:]
+        prev = kick
+        layer = np.zeros_like(frame)
+        if len(pos):
+            new = pos + vel
+            th = 2 + int(3 * bass)
+            for (x0, y0), (x1, y1), c in zip(pos, new, col):
+                cv2.line(layer, (int(x0), int(y0)), (int(x1), int(y1)), (int(c[0]), int(c[1]), int(c[2])), th)
+            pos, vel, ttl = new, vel * 0.96, ttl - 1
+            vel[:, 1] += (mid - 0.5) * 0.5
+            keep = (ttl > 0) & (pos[:, 0] >= 0) & (pos[:, 0] < w) & (pos[:, 1] >= 0) & (pos[:, 1] < h)
+            pos, vel, ttl, col = pos[keep], vel[keep], ttl[keep], col[keep]
+        glow = cv2.resize(cv2.GaussianBlur(cv2.resize(layer, (max(1, w // 4), max(1, h // 4))), (0, 0), 3), (w, h))
+        yield cv2.add(cv2.add(frame, layer), cv2.addWeighted(glow, 1.6, glow, 0, 0))
+
+def film_look_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Proiettore impazzito: il fotogramma ballonzola nel gate coi bassi, l'esposizione lampeggia sui
+    kick (con bruciatura arancio ai colpi forti), la grana cresce con gli acuti, la vignettatura
+    con il volume e le righe verticali di graffi compaiono sugli attacchi."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xs, ys = _grid(h, w)
+    r2 = (((xs - w / 2.0) / (w / 2.0)) ** 2 + ((ys - h / 2.0) / (h / 2.0)) ** 2) / 2.0
+    prev = 0.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass, high, rms, hit = (float(au.kick[k]), float(au.bass[k]), float(au.high[k]),
+                                      float(au.rms[k]), float(au.onset[k]))
+        frame = _blend(img1, img2, a)
+        wy, wx = random.uniform(-1, 1) * bass * env * intensity * 0.5, random.uniform(-1, 1) * bass * env * intensity * 0.3
+        frame = cv2.warpAffine(frame, np.float32([[1, 0, wx], [0, 1, wy]]), (w, h), borderMode=cv2.BORDER_REPLICATE)
+        out = frame.astype(np.float32) * (1.0 + (random.uniform(-0.05, 0.05) + 0.25 * kick) * env)
+        out *= (1.0 - (0.25 + 0.5 * rms) * env * r2)[:, :, None]
+        burn = float(np.clip((kick - 0.55) * 3.0, 0, 1) * env)
+        if burn > 0.05:
+            bx = random.choice((0.0, float(w)))
+            blob = np.exp(-(((xs - bx) / (w * 0.35)) ** 2 + ((ys - h * random.uniform(0.2, 0.8)) / (h * 0.5)) ** 2))
+            out += blob[:, :, None] * np.array([255, 150, 60], np.float32) * (0.7 * burn)
+        sigma = intensity * (0.3 + high) * env
+        if sigma > 0.5:
+            grain = cv2.resize(np.random.standard_normal((max(1, h // 2), max(1, w // 2))).astype(np.float32) * sigma,
+                               (w, h), interpolation=cv2.INTER_LINEAR)
+            out += grain[:, :, None]
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        if hit > 0.4 and prev <= 0.4:
+            for _ in range(int(1 + 5 * hit * env)):
+                x, y0 = random.randint(0, w - 1), random.randint(0, h // 2)
+                cv2.line(out, (x, y0), (x + random.randint(-2, 2), y0 + random.randint(h // 4, h // 2)), (225, 225, 225), 1)
+        prev = hit
+        yield out
+
+def vhs_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Nastro rovinato: il kick fa 'slittare' il quadro in verticale (molla), i bassi allargano la banda di
+    tracking che strappa le righe, il volume sporca il colore (bleeding R/B), gli acuti aggiungono
+    righe di rumore e il rumore da testina in fondo al quadro."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    xs, ys = _grid(h, w)
+    roll_pos = roll_vel = phase = prev = 0.0
+    amp = intensity / 15.0
+    for k, a in enumerate(al):
+        env = _env(a)
+        kick, bass, high, rms = float(au.kick[k]), float(au.bass[k]), float(au.high[k]), float(au.rms[k])
+        if kick > 0.55 and prev <= 0.55:
+            roll_vel += random.choice((-1, 1)) * h * 0.04 * kick
+        prev = kick
+        roll_pos = (roll_pos + roll_vel) * 0.8
+        roll_vel *= 0.7
+        frame = np.roll(_blend(img1, img2, a), int(roll_pos * env), axis=0)
+        jit = cv2.GaussianBlur(np.random.standard_normal((h, 1)).astype(np.float32), (1, 0), 6) * (1.0 + 6.0 * high) * env * 3.0
+        phase += 0.15
+        band_c = int(h * (0.80 + 0.15 * np.sin(phase)))
+        bh = int(h * 0.04 * (1 + 3 * bass) * env)
+        if bh > 0:
+            lo = max(0, band_c - bh // 2)
+            jit[lo:lo + bh, 0] += np.random.uniform(-1, 1, len(jit[lo:lo + bh, 0])) * (20 + 80 * rms) * amp
+        frame = cv2.remap(frame, xs + jit, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        c = int((2 + 8 * rms) * env * amp)
         r, g, b = cv2.split(frame)
-        r = cv2.warpAffine(r, np.float32([[1, 0, s], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REPLICATE)
-        b = cv2.warpAffine(b, np.float32([[1, 0, -s], [0, 1, 0]]), (w, h), borderMode=cv2.BORDER_REPLICATE)
-        yield cv2.merge([r, g, b])
-
-def particle_float_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    h, w = img1.shape[:2]
-    particles = [(random.randint(0, w), random.randint(0, h)) for _ in range(50)]
-    for a in _alphas(num_frames, easing, alphas):
-        frame = _blend(img1, img2, a)
-        for x, y in particles:
-            nx = min(w - 1, max(0, x + random.randint(-intensity, intensity)))
-            ny = min(h - 1, max(0, y + random.randint(-intensity, intensity)))
-            cv2.circle(frame, (nx, ny), 2, (255, 255, 255), -1)
+        if c:
+            r = cv2.blur(np.roll(r, c, axis=1), (9, 1))
+            b = cv2.blur(np.roll(b, -c, axis=1), (9, 1))
+        frame = cv2.merge([r, g, b])
+        nh = max(1, int(h * 0.03 * env))
+        if env > 0.05:
+            frame[h - nh:] = cv2.addWeighted(frame[h - nh:], 0.3, np.random.randint(0, 256, (nh, w, 3), dtype=np.uint8), 0.7, 0)
+        for _ in range(int(env * (2 + 20 * high))):
+            y, x = random.randint(0, h - 1), random.randint(0, w - 40)
+            cv2.line(frame, (x, y), (x + random.randint(10, 40), y), (235, 235, 235), 1)
         yield frame
 
-def film_look_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def motion_blur_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Strisciata direzionale: la lunghezza della scia esplode sui kick, la direzione ruota coi medi,
+    e le alte luci vengono tirate in strisce anamorfiche (alone orizzontale azzurrino) sui colpi."""
     h, w = img1.shape[:2]
-    for a in _alphas(num_frames, easing, alphas):
-        blend = _blend(img1, img2, a)
-        noise = np.clip(np.random.normal(128, intensity, (h, w, 3)), 0, 255).astype(np.uint8)
-        flicker = random.uniform(0.95, 1.05)
-        # noise centrato su 128: sottraiamo l'offset per ottenere grana simmetrica
-        yield cv2.addWeighted(blend, flicker, noise, 0.12, -128 * 0.12)
-
-def vhs_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    h, w = img1.shape[:2]
-    for a in _alphas(num_frames, easing, alphas):
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    hw, hh = max(1, w // 2), max(1, h // 2)
+    qw, qh = max(1, w // 4), max(1, h // 4)
+    kq = max(3, int(qw * 0.4)) | 1
+    angle, taps = 0.0, 9
+    for k, a in enumerate(al):
+        env, kick, mid, rms = _env(a), float(au.kick[k]), float(au.mid[k]), float(au.rms[k])
         frame = _blend(img1, img2, a)
-        for _ in range(intensity):
-            y = random.randint(0, h - 1)
-            frame[y:y+1] = np.roll(frame[y:y+1], random.randint(-5, 5), axis=1)
-        frame[:, :, 0] = cv2.equalizeHist(np.ascontiguousarray(frame[:, :, 0]))
-        yield frame
+        angle += 0.05 + 0.3 * mid
+        L = (0.01 + 0.10 * kick + 0.04 * rms) * w * env * (intensity / 15.0)
+        small = cv2.resize(frame, (hw, hh), interpolation=cv2.INTER_AREA)
+        acc = np.zeros(small.shape, np.float32)
+        for t in np.linspace(-0.5, 0.5, taps):
+            M = np.float32([[1, 0, t * L * np.cos(angle) / 2.0], [0, 1, t * L * np.sin(angle) / 2.0]])
+            acc += cv2.warpAffine(small, M, (hw, hh), borderMode=cv2.BORDER_REPLICATE)
+        blurred = cv2.resize((acc / taps).astype(np.uint8), (w, h), interpolation=cv2.INTER_LINEAR)
+        m = float(np.clip(env * (0.4 + 0.6 * kick), 0, 1))
+        out = cv2.addWeighted(frame, 1 - m, blurred, m, 0)
+        streak = float(kick * env)
+        if streak > 0.1:
+            q = cv2.resize(frame, (qw, qh), interpolation=cv2.INTER_AREA).astype(np.float32)
+            hi = q * (q.mean(axis=2, keepdims=True) > 175)
+            hi = cv2.blur(hi, (kq, 1)) * np.array([0.7, 0.95, 1.25], np.float32)
+            out = cv2.add(out, cv2.resize(np.clip(hi * (0.8 * streak), 0, 255).astype(np.uint8), (w, h)))
+        yield out
 
-def motion_blur_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    k = max(3, intensity) | 1  # kernel dispari → centrato
-    kernel = np.zeros((k, k), dtype=np.float32)
-    kernel[k // 2, :] = 1.0 / k
-    for a in _alphas(num_frames, easing, alphas):
-        yield cv2.filter2D(_blend(img1, img2, a), -1, kernel)
-
-def scanlines_effect(img1, img2, num_frames, intensity, easing, alphas=None):
+def scanlines_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Monitor CRT: lo schermo si CURVA (barrel) sui kick e sui bassi, le scanline si scavano col volume
+    e scorrono in verticale sui colpi, la maschera RGB a triadi si accende e le alte luci
+    sbavano (bloom)."""
     h, w = img1.shape[:2]
-    spacing = max(2, 10 - intensity // 5)  # min 2: a intensità alta non scurisce TUTTE le righe
-    mask = np.ones((h, 1, 1), dtype=np.float32)
-    mask[::spacing] = 0.5
-    for a in _alphas(num_frames, easing, alphas):
-        yield (_blend(img1, img2, a).astype(np.float32) * mask).astype(np.uint8)
-
-def burn_in_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    h, w = img1.shape[:2]
-    overlay = np.zeros_like(img1, dtype=np.uint8)
-    for i in range(0, h, 20):
-        cv2.line(overlay, (0, i), (w, i), (intensity * 5, intensity * 3, intensity * 2), 1)
-    for a in _alphas(num_frames, easing, alphas):
-        yield cv2.addWeighted(_blend(img1, img2, a), 1, overlay, 0.2, 0)
-
-def light_leaks_effect(img1, img2, num_frames, intensity, easing, alphas=None):
-    h, w = img1.shape[:2]
-    # glow disegnato e sfocato a 1/4 di risoluzione, poi ingrandito (molto più economico)
-    small_w, small_h = max(1, w // 4), max(1, h // 4)
-    for a in _alphas(num_frames, easing, alphas):
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    cx, cy = w / 2.0, h / 2.0
+    xs, ys = _grid(h, w)
+    ddx, ddy = xs - cx, ys - cy
+    r2 = (ddx / cx) ** 2 + (ddy / cy) ** 2
+    y1d = np.arange(h, dtype=np.float32)
+    tri = np.array([[1, .55, .55], [.55, 1, .55], [.55, .55, 1]], np.float32)[np.arange(w) % 3]
+    roll, prev = 0.0, 0.0
+    amp = min(1.0, intensity / 20.0)
+    for k, a in enumerate(al):
+        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
+        if kick > 0.55 and prev <= 0.55:
+            roll += random.uniform(1, 3)
+        prev = kick
+        kb = (0.04 + 0.28 * kick + 0.10 * bass) * (env ** 1.5) * amp * 1.5
         frame = _blend(img1, img2, a)
-        leak_small = np.zeros((small_h, small_w, 3), dtype=np.uint8)
-        cv2.circle(leak_small,
-                   (random.randint(0, small_w), random.randint(0, small_h)),
-                   random.randint(small_w // 4, small_w // 2) or 1,
-                   (intensity * 5, intensity * 3, intensity * 2), -1)
-        leak_small = cv2.GaussianBlur(leak_small, (25, 25), 0)
-        leak = cv2.resize(leak_small, (w, h), interpolation=cv2.INTER_LINEAR)
-        yield cv2.addWeighted(frame, 1, leak, 0.3, 0)
+        warped = cv2.remap(frame, (cx + ddx * (1 + kb * r2)).astype(np.float32), (cy + ddy * (1 + kb * r2)).astype(np.float32),
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        out = warped.astype(np.float32)
+        d = (0.3 + 0.5 * rms) * env
+        out *= (1 - d * 0.5 * (1 + np.cos(2 * np.pi * (y1d + roll) / 3.0)))[:, None, None]
+        out *= (1 - 0.35 * env * amp + 0.35 * env * amp * tri)[None, :, :]
+        bloom = cv2.resize(cv2.GaussianBlur(cv2.resize(warped, (max(1, w // 4), max(1, h // 4))), (0, 0), 4), (w, h))
+        out += bloom.astype(np.float32) * ((0.2 + 0.5 * kick) * env)
+        out *= 1.0 + 0.04 * np.sin(k * 1.7) * env
+        yield np.clip(out, 0, 255).astype(np.uint8)
+
+def burn_in_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Burn-in: la prima immagine resta 'bruciata' sullo schermo come fosforo, si allarga e scivola
+    (i bassi la trascinano) mentre svanisce; ogni kick imprime un nuovo fantasma ambra del frame
+    corrente. Fusione 'screen', così il doppione si vede sopra l'immagine nuova."""
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    tint = np.array([1.0, 0.78, 0.45], np.float32)
+    center = (w / 2.0, h / 2.0)
+    P, prev = None, 0.0
+    for k, a in enumerate(al):
+        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
+        cur = _blend(img1, img2, a).astype(np.float32)
+        if P is None or (kick > 0.55 and prev <= 0.55):
+            P = cur.copy()
+        prev = kick
+        M = cv2.getRotationMatrix2D(center, 0, 1.0 + 0.012 + 0.03 * rms)
+        M[0, 2] += 4 + bass * 14
+        P = cv2.warpAffine(P, M, (w, h), borderMode=cv2.BORDER_REPLICATE) * (0.88 + 0.08 * rms)
+        g = float(np.clip(env * min(1.0, intensity / 15.0 + 0.4), 0, 1))
+        ghost = np.clip(P * tint * 1.5, 0, 255)
+        screened = 255.0 - (255.0 - cur) * (255.0 - ghost) / 255.0
+        yield np.clip(cur * (1 - g) + screened * g, 0, 255).astype(np.uint8)
+
+def light_leaks_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    """Perdite di luce spettrali: tre aloni morbidi si muovono in orbite lente, il loro colore deriva con
+    gli acuti e la luminosità segue il volume; ogni kick spara un flare bianco-giallo con striscia
+    orizzontale. Fusione 'screen' come su pellicola."""
+    import colorsys
+    h, w = img1.shape[:2]
+    al = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(al))
+    sw, sh = max(1, w // 4), max(1, h // 4)
+    gx, gy = np.meshgrid(np.linspace(0, 1, sw, dtype=np.float32), np.linspace(0, 1, sh, dtype=np.float32))
+    leaks = [{"ph": random.uniform(0, 6.28), "sp": random.uniform(0.05, 0.15), "hue": random.uniform(0, 0.12)} for _ in range(3)]
+    flare, prev = 0.0, 0.0
+    fx, fy = 0.5, 0.5
+    for k, a in enumerate(al):
+        env, kick, rms, bass, high = _env(a), float(au.kick[k]), float(au.rms[k]), float(au.bass[k]), float(au.high[k])
+        if kick > 0.55 and prev <= 0.55:
+            flare, fx, fy = 1.0, random.uniform(0.15, 0.85), random.uniform(0.15, 0.85)
+        prev = kick
+        frame = _blend(img1, img2, a)
+        layer = np.zeros((sh, sw, 3), np.float32)
+        for i, lk in enumerate(leaks):
+            cx = 0.5 + 0.55 * np.sin(lk["ph"] + k * lk["sp"] * (1 + i))
+            cy = 0.5 + 0.55 * np.cos(lk["ph"] * 1.3 + k * lk["sp"])
+            sig = 0.25 * (0.7 + bass)
+            g = np.exp(-((gx - cx) ** 2 + (gy - cy) ** 2) / (2 * sig * sig))[:, :, None]
+            col = np.array(colorsys.hsv_to_rgb((lk["hue"] + 0.3 * high + 0.2 * i) % 1.0, 0.85, 1.0), np.float32)
+            layer += g * col * (255.0 * (0.12 + 0.35 * rms + 0.25 * kick) * env)
+        if flare > 0.05:
+            fl = np.exp(-(((gx - fx) / 0.35) ** 2 + ((gy - fy) / 0.035) ** 2) / 2.0) + \
+                 np.exp(-(((gx - fx) ** 2 + (gy - fy) ** 2) / (2 * 0.06 ** 2)))
+            layer += fl[:, :, None] * np.array([255, 235, 170], np.float32) * (0.7 * flare * env)
+            flare *= 0.7
+        leak = cv2.resize(np.clip(layer, 0, 255), (w, h), interpolation=cv2.INTER_LINEAR)
+        yield np.clip(255.0 - (255.0 - frame.astype(np.float32)) * (255.0 - leak) / 255.0, 0, 255).astype(np.uint8)
 
 
 # ─────────────────────────────────────────────
@@ -675,27 +987,29 @@ def luma_crush_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
         mix = float(np.clip(env * (0.3 + 0.7 * kick), 0, 1))
         yield np.clip(frame * (1 - mix) + crushed * mix, 0, 255).astype(np.uint8)
 
-AUDIO_EFFECTS = {"Spectrum Reveal", "Kick Zoom", "Flow Smear", "Block Shuffle", "Slit Scan", "Feedback Tunnel",
-                 "Pixel Sort", "Shockwave", "Kaleido Pulse", "Time Slice", "Shatter", "Luma Crush"}
+AUDIO_EFFECTS = set()  # riempito dopo effect_funcs
 
 # ── Combo: UNA curva alpha globale tagliata in fette → continuità + frame esatti ──
-def _combo(funcs, img1, img2, num_frames, intensity, easing, alphas):
+def _combo(funcs, img1, img2, num_frames, intensity, easing, alphas, audio=None):
     full = _alphas(num_frames, easing, alphas)
+    au = _au(audio, len(full))
+    start = 0
     for fn, part in zip(funcs, np.array_split(np.asarray(full), len(funcs))):
         if len(part) == 0:
             continue
-        yield from fn(img1, img2, len(part), intensity, easing, alphas=part)
+        yield from fn(img1, img2, len(part), intensity, easing, alphas=part, audio=au.slice(start, len(part)))
+        start += len(part)
 
-def combo_effect_preset1(img1, img2, num_frames, intensity, easing, alphas=None):
-    yield from _combo((glitch_effect, pixelate_effect), img1, img2, num_frames, intensity, easing, alphas)
+def combo_effect_preset1(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
+    yield from _combo((glitch_effect, pixelate_effect), img1, img2, num_frames, intensity, easing, alphas, audio)
 
-def combo_effect_preset2(img1, img2, num_frames, intensity, easing, alphas=None):
+def combo_effect_preset2(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
     yield from _combo((wave_distort_effect, color_echo_effect, particle_float_effect),
-                      img1, img2, num_frames, intensity, easing, alphas)
+                      img1, img2, num_frames, intensity, easing, alphas, audio)
 
-def combo_effect_preset3(img1, img2, num_frames, intensity, easing, alphas=None):
+def combo_effect_preset3(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
     yield from _combo((motion_blur_effect, film_look_effect, zoom_random_effect),
-                      img1, img2, num_frames, intensity, easing, alphas)
+                      img1, img2, num_frames, intensity, easing, alphas, audio)
 
 # ─────────────────────────────────────────────
 # DIZIONARIO EFFETTI
@@ -737,26 +1051,28 @@ effect_funcs = {
     "Combo Creative 3": combo_effect_preset3,
 }
 
+AUDIO_EFFECTS.update(k for k in effect_funcs if k != "Zoom Random")  # tutti reattivi tranne Zoom Random
+
 effect_descriptions = {
-    "Fade": "Classic dissolve between one frame and the next.",
-    "Morph": "Optical-flow morph (Farneback): pixels slide from one image to the other, then crossfade. Pure DSP.",
-    "Glitch": "Digital artifacts and row displacement typical of a corrupted signal.",
-    "Pixelate": "Progressive pixelation with random scale for an 8-bit look.",
-    "Corrupt Lines": "Corrupted data lines randomly appearing on the frame.",
-    "Wave Distort": "Sinusoidal wave distortion of the horizontal rows.",
-    "Zoom": "Punch-in from the center, returns to 1x at the end of the transition.",
+    "Fade": "Audio-reactive dissolve: R, G and B crossfade at different times (bass, mids, highs) and every kick lights a bloom.",
+    "Morph": "Audio-reactive elastic optical-flow morph: kicks push and pull the pixel motion, highs split the three color channels along the flow.",
+    "Glitch": "Audio-reactive glitch: each hit spawns stuck horizontal slices that slide sideways, split in RGB and sometimes show the other image.",
+    "Pixelate": "Audio-reactive mosaic: pixel size pulses with kick and bass, the palette collapses on hits and blocks invert on strong ones.",
+    "Corrupt Lines": "Audio-reactive databending: pixels are stretched into horizontal and vertical streaks, bass sets their length, highs open noise blocks.",
+    "Wave Distort": "Audio-reactive liquid waves on both axes: bass and kick set the amplitude, mids the wavelength, highs the speed, with per-channel aberration.",
+    "Zoom": "Audio-reactive radial zoom blur: every kick shoots the frame toward the center with speed streaks and a slight mid-driven rotation.",
     "Zoom Random": "Zoom from a random focus for a chaotic effect, retracts at the end of the transition.",
-    "Wipe Direzionale": "Horizontal left-to-right wipe with a soft edge.",
-    "Wipe Diagonale": "Diagonal wipe from top-left to bottom-right corner with a soft edge.",
-    "Iris Circolare": "Circular opening from the center to the edges, cinema iris style.",
-    "Color Echo": "Chromatic aberration: R and B channels split in opposite directions.",
-    "Particle Float": "White floating particles over the blend.",
-    "Film Look": "Cinematic grain with exposure flicker.",
-    "VHS": "Magnetic tape artifacts with red-channel equalization.",
-    "Motion Blur": "Horizontal motion blur on the blended frame.",
-    "Scanlines": "CRT-monitor style scanlines.",
-    "Burn-in": "Line overlay with a phosphor burn-in effect.",
-    "Light Leaks": "Colored light halos projected on the frame, analog style.",
+    "Wipe Direzionale": "Audio-reactive spectrum wipe: each row moves the front by its own frequency band, a glowing line rides the edge on kicks.",
+    "Wipe Diagonale": "Audio-reactive diagonal blinds: 14 stripes sweep in alternating directions, each lagging by its band energy, edges flash on kicks.",
+    "Iris Circolare": "Audio-reactive spectrum iris: the circle edge takes a different radius at every angle, a pulsing star shaped by the spectrum.",
+    "Color Echo": "Audio-reactive temporal echo: R, G and B pull from different past frames (bass, mids, highs) and slide apart on hits.",
+    "Particle Float": "Audio-reactive sparks: every kick bursts a swarm of trailing particles colored by the image, with a glow.",
+    "Film Look": "Audio-reactive broken projector: gate weave with bass, exposure flashes and orange burns on kicks, grain with highs, scratches on attacks.",
+    "VHS": "Audio-reactive damaged tape: kicks slip the picture vertically, bass widens the tracking tear, volume bleeds the color, highs add noise lines.",
+    "Motion Blur": "Audio-reactive directional smear: streak length explodes on kicks, direction rotates with mids, highlights stretch into anamorphic streaks.",
+    "Scanlines": "Audio-reactive CRT: the screen curves on kicks and bass, scanlines deepen with volume, RGB triad mask and phosphor bloom.",
+    "Burn-in": "Audio-reactive burn-in: the first image stays burned like phosphor and fades slowly, every kick stamps a new amber ghost that bass drags sideways.",
+    "Light Leaks": "Audio-reactive light leaks: three orbiting glows that drift in color with highs and brighten with volume, kicks fire a streaked flare.",
     "Spectrum Reveal": "Audio-reactive: the next image rises through an equalizer, each bar following its own frequency band.",
     "Kick Zoom": "Audio-reactive: the focus jumps on every hit, zoom and rotation snap on the kick, bass shakes the frame.",
     "Flow Smear": "Audio-reactive datamosh: pixels are dragged along optical-flow vectors, pushed by kick and volume.",
@@ -769,9 +1085,9 @@ effect_descriptions = {
     "Time Slice": "Audio-reactive time slicing: each of 32 bands pulls from a past frame as old as its frequency energy.",
     "Shatter": "Audio-reactive shatter: the image breaks into Voronoi shards that are blasted outward on every kick.",
     "Luma Crush": "Audio-reactive luma-key with Bayer dithering: hits posterize the image, swap color channels and add noise.",
-    "Combo Creative 1": "Glitch + Pixelate in sequence (continuous alpha curve).",
-    "Combo Creative 2": "Wave Distort + Color Echo + Particle Float in sequence.",
-    "Combo Creative 3": "Motion Blur + Film Look + Zoom Random in sequence.",
+    "Combo Creative 1": "Audio-reactive Glitch + Pixelate in sequence (continuous alpha curve).",
+    "Combo Creative 2": "Audio-reactive Wave Distort + Color Echo + Particle Float in sequence.",
+    "Combo Creative 3": "Audio-reactive Motion Blur + Film Look + Zoom Random in sequence.",
 }
 
 # ─────────────────────────────────────────────
@@ -885,7 +1201,7 @@ def repeat_pattern_to_length(pattern, target_frames, min_frames=4):
 # ─────────────────────────────────────────────
 # AUDIO: ANALISI + MUX
 # ─────────────────────────────────────────────
-def load_audio_streaming(path, target_sr=22050, block_seconds=30):
+def load_audio_streaming(path, target_sr=22050, block_seconds=30, max_seconds=None):
     """Decodifica a blocchi (mono, 22.05 kHz): la RAM è ~0.09 MB per secondo di brano, mentre
     librosa.load tiene l'intero file decodificato stereo a piena frequenza (~0.7 MB/s in transitorio)."""
     try:
@@ -894,16 +1210,19 @@ def load_audio_streaming(path, target_sr=22050, block_seconds=30):
         with sf.SoundFile(path) as f:
             sr_in = f.samplerate
             rs = soxr.ResampleStream(sr_in, target_sr, 1, dtype="float32") if sr_in != target_sr else None
-            out = []
+            out, limit = [], (int(max_seconds * target_sr) if max_seconds else None)
             for block in f.blocks(blocksize=int(block_seconds * sr_in), dtype="float32", always_2d=True):
                 mono = np.ascontiguousarray(block.mean(axis=1), dtype=np.float32)
                 out.append(rs.resample_chunk(mono) if rs else mono)
+                if limit and sum(len(o) for o in out) >= limit:
+                    break
             if rs:
                 out.append(rs.resample_chunk(np.zeros(0, dtype=np.float32), last=True))
-        return np.concatenate(out), target_sr
+        y = np.concatenate(out)
+        return (y[:limit] if limit else y), target_sr
     except Exception:
         import librosa  # formati/versioni non gestiti da soundfile: percorso classico
-        return librosa.load(path, sr=target_sr, mono=True)
+        return librosa.load(path, sr=target_sr, mono=True, duration=max_seconds)
 
 def _spectral_pass(y, sr, hop=512, seg_seconds=60):
     """STFT a blocchi da ~60 s → rms, mel a 128 bande (beat) e mel a 32 bande (feature).
@@ -961,10 +1280,10 @@ def extract_audio_features(rms, mel_db, sr, hop, duration, fps, n_bands=N_BANDS)
         bands=np.clip(_smooth_ad(bands_v, 0.7, 0.3), 0, 1),
     )
 
-def analyze_audio(audio_path, grid_mode, fps=24):
+def analyze_audio(audio_path, grid_mode, fps=24, max_seconds=None):
     import librosa
     hop = 512
-    y, sr = load_audio_streaming(audio_path, 22050)
+    y, sr = load_audio_streaming(audio_path, 22050, max_seconds=max_seconds)
     duration = len(y) / sr
     rms, mel128, mel32 = _spectral_pass(y, sr, hop)
     del y  # il segnale non serve più: da qui lavoriamo su matrici piccole
@@ -1034,11 +1353,16 @@ def make_preview_proxy(video_path, max_side=480):
 # RENDER IN STREAMING
 # ─────────────────────────────────────────────
 def build_video(images, image_sequence, frame_counts, effect_choice, intensity, easing,
-                ffmpeg_preset, fps, rnd, on_progress=None, features=None, quality=8, macro_block_size=16):
+                ffmpeg_preset, fps, rnd, on_progress=None, features=None, crf=22, macro_block_size=16, maxrate=None):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         video_path = tmp.name
-    writer = imageio.get_writer(video_path, fps=fps, codec="libx264", quality=quality,
-                                macro_block_size=macro_block_size, output_params=["-preset", ffmpeg_preset])
+    # CRF esplicito (quality=None: imageio non ne aggiunge uno suo; con quality=8 sarebbe CRF 10 → file enormi)
+    # + tetto di bitrate opzionale (CRF vincolato): il peso massimo del file è noto in anticipo
+    params = ["-preset", ffmpeg_preset, "-crf", str(int(crf))]
+    if maxrate:
+        params += ["-maxrate", f"{maxrate}M", "-bufsize", f"{2 * maxrate}M"]
+    writer = imageio.get_writer(video_path, fps=fps, codec="libx264", quality=None,
+                                macro_block_size=macro_block_size, output_params=params)
     mixed_used, written, cursor = [], 0, 0
     if features is None:  # senza brano: ritmo sintetico, ma deterministico (seed)
         features = AudioFeatures.synthetic(sum(frame_counts), fps, rnd)
@@ -1050,7 +1374,7 @@ def build_video(images, image_sequence, frame_counts, effect_choice, intensity, 
                 mixed_used.append(eff_name)
             if on_progress:
                 on_progress(i, len(frame_counts), eff_name)
-            kwargs = {"audio": features.slice(cursor, n_fr)} if eff_name in AUDIO_EFFECTS else {}
+            kwargs = {"audio": features.slice(cursor, n_fr)}
             cursor += n_fr
             for fr in effect_funcs[eff_name](images[idx1], images[idx2], n_fr, intensity, easing, **kwargs):
                 writer.append_data(fr)
@@ -1197,6 +1521,10 @@ with col4:
     )
     ffmpeg_preset = {"⚖️ Bilanciato": "medium", "⚡ Velocità (file leggermente più pesante)": "veryfast",
                      "🎯 Qualità (più lento)": "slow"}[speed_label]
+    quality_label = st.radio("Qualità / peso del file", list(QUALITY_PRESETS), index=1, horizontal=True,
+                             help="Stime misurate a 720p con immagini lisce. Con foto molto granulose il peso sale fino a "
+                                  "circa 13 / 23 / 44 MB ogni 30 s (il tetto di bitrate lo limita).")
+    crf_sel, maxrate_sel = QUALITY_PRESETS[quality_label]
 
 if n_up >= 2 and not (use_music and audio_file is not None):
     min_s = (n_up - 1) * 4 / 24
@@ -1226,18 +1554,41 @@ if preview_btn:
             prev_fps, prev_frames = 12, 18  # 1,5 s per transizione
             imgs_p = [load_image_fit(f, *prev_size) for f in uploaded_files[:n_prev]]
             counts_p = [prev_frames] * (n_prev - 1)
+            # con un brano caricato: feature audio vere dei primi 16 s (in cache) + audio nell'anteprima
+            features_p, audio_path_p = None, None
+            if use_music and audio_file is not None:
+                try:
+                    raw_a = audio_file.getvalue()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio_file.name)[1]) as ta:
+                        ta.write(raw_a)
+                        audio_path_p = ta.name
+                    ckey = (audio_file.name, len(raw_a))
+                    cache = st.session_state.get("preview_audio_cache")
+                    if cache and cache["key"] == ckey:
+                        features_p = cache["features"]
+                    else:
+                        features_p = analyze_audio(audio_path_p, "normal", prev_fps, max_seconds=16.0)[4]
+                        st.session_state["preview_audio_cache"] = {"key": ckey, "features": features_p}
+                except Exception as e:
+                    st.warning(f"⚠️ Non riesco ad analizzare il brano per l'anteprima ({e}): uso il ritmo sintetico.")
+                    features_p = None
             path_p, written_p, mixed_p = build_video(
                 imgs_p, list(range(n_prev)), counts_p, effect_choice, intensity, easing_choice,
-                "ultrafast", prev_fps, random.Random(int(seed_input) or None), None, None, 5, None)
-            with open(path_p, "rb") as f:
+                "ultrafast", prev_fps, random.Random(int(seed_input) or None), None, features_p, 30, None)
+            final_p = path_p
+            if audio_path_p and features_p is not None:
+                muxed_p, _err = mux_audio(path_p, audio_path_p)
+                final_p = muxed_p or path_p
+            with open(final_p, "rb") as f:
                 data_p = f.read()
-            _safe_remove(path_p)
+            _safe_remove(path_p, final_p if final_p != path_p else None, audio_path_p)
             used = ", ".join(sorted(set(mixed_p))) if mixed_p else effect_choice
             note = "" if n_prev == prev_n else f" (ne hai caricate solo {n_up})"
+            audio_note = " · audio: il tuo brano" if features_p is not None else " · ritmo sintetico"
             st.session_state["preview_quick"] = {
                 "bytes": data_p, "width": prev_size[0],
                 "caption": f"{n_prev} immagini{note} · {len(counts_p)} transizioni · {written_p / prev_fps:.1f} s · "
-                           f"{prev_size[0]}×{prev_size[1]} · effetto: {used}"}
+                           f"{prev_size[0]}×{prev_size[1]} · effetto: {used}{audio_note}"}
 
 quick = st.session_state.get("preview_quick")
 if quick:
@@ -1318,7 +1669,7 @@ if video_btn and upload_ok:
 
     video_path, total_frames_written, mixed_effects_used = build_video(
         images, image_sequence, frame_counts, effect_choice, intensity, easing_choice,
-        ffmpeg_preset, FPS, rnd, _on_progress, audio_features)
+        ffmpeg_preset, FPS, rnd, _on_progress, audio_features, crf=crf_sel, maxrate=maxrate_sel)
     progress.progress(1.0)
     status.text("Scrittura video completata...")
 
@@ -1387,7 +1738,7 @@ if st.session_state.get("video_ready"):
 
     with dl_cols[0]:
         st.download_button(
-            label="📥 Scarica Video (.mp4)",
+            label=f"📥 Scarica Video (.mp4) · {len(st.session_state['video_bytes']) / 1e6:.1f} MB",
             data=st.session_state["video_bytes"],
             file_name="loop507_output.mp4",
             mime="video/mp4",
