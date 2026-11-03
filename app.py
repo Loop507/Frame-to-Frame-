@@ -53,6 +53,15 @@ def _env(a):
     """Inviluppo 0→1→0 sulla transizione: gli effetti 'a impulso' partono e finiscono a riposo."""
     return float(np.sin(np.pi * a))
 
+def _gain(a, au, k):
+    """Guadagno degli effetti guidati dai COLPI. Con le transizioni agganciate ai beat il colpo cade
+    all'inizio (o negli ultimi frame) della transizione: l'inviluppo simmetrico _env lo spegneva
+    (valeva 0 a inizio e fine). Qui il guadagno vale 1 fino al 55% e scende a 0 verso la fine, ma un
+    colpo in corso lo riporta su: l'effetto scatta sempre sul beat, qualunque sia la sua fase rispetto
+    ai confini, e senza colpi la transizione termina pulita sull'immagine di arrivo."""
+    base = 1.0 if a < 0.55 else float(0.5 * (1.0 + np.cos(np.pi * (a - 0.55) / 0.45)))
+    return max(base, float(max(au.kick[k], au.onset[k])))
+
 def _grid(h, w):
     return np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
 
@@ -125,11 +134,11 @@ def fade_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=No
     f1, f2 = img1.astype(np.float32), img2.astype(np.float32)
     spread = 0.25 + intensity / 60.0
     for k, a in enumerate(al):
-        env, kick = _env(a), float(au.kick[k])
+        env, gn, kick = _env(a), _gain(a, au, k), float(au.kick[k])
         e = np.array([au.bass[k], au.mid[k], au.high[k]], dtype=np.float32)
         ac = np.clip(a + spread * env * (e - 0.5) * 2.0, 0, 1).astype(np.float32)
-        out = (f1 * (1 - ac) + f2 * ac) * (1.0 + 0.15 * kick * env)
-        glow_amt = float(kick * env)
+        out = (f1 * (1 - ac) + f2 * ac) * (1.0 + 0.15 * kick * gn)
+        glow_amt = float(kick * gn)
         if glow_amt > 0.1:
             g = cv2.GaussianBlur(cv2.resize(out, (max(1, w // 4), max(1, h // 4))), (0, 0), 5)
             out = out + cv2.resize(g, (w, h)) * (0.40 * glow_amt)
@@ -145,7 +154,7 @@ def morph_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=N
     xs, ys = _grid(h, w)
     ch1, ch2 = cv2.split(img1), cv2.split(img2)
     for k, a in enumerate(al):
-        env, kick, high = _env(a), float(au.kick[k]), float(au.high[k])
+        env, kick, high = _gain(a, au, k), float(au.kick[k]), float(au.high[k])
         push = 0.30 * (kick - 0.25) * env
         p1, p2 = a + push, (1 - a) - push
         scales = (1.0 + 0.20 * high * env, 1.0, 1.0 - 0.20 * high * env)
@@ -165,7 +174,7 @@ def glitch_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=
     amp = intensity / 15.0
     slices, prev = [], 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         hit, bass, high = float(au.onset[k]), float(au.bass[k]), float(au.high[k])
         remaining = len(al) - k - 2
         if hit > 0.4 and prev <= 0.4 and remaining > 0:
@@ -200,7 +209,7 @@ def pixelate_effect(img1, img2, num_frames, intensity, easing, alphas=None, audi
     au = _au(audio, len(al))
     amp = min(1.0, intensity / 12.0 + 0.3)
     for k, a in enumerate(al):
-        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
+        env, kick, bass, rms = _gain(a, au, k), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
         frame = _blend(img1, img2, a)
         pulse = max(kick, 0.2 + 0.4 * rms)
         bs = int(1 + (4 + 56 * pulse * (0.5 + 0.5 * bass)) * env * amp)
@@ -223,7 +232,7 @@ def corrupt_lines_effect(img1, img2, num_frames, intensity, easing, alphas=None,
     au = _au(audio, len(al))
     amp = intensity / 15.0
     for k, a in enumerate(al):
-        env, kick, bass, high = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.high[k])
+        env, kick, bass, high = _gain(a, au, k), float(au.kick[k]), float(au.bass[k]), float(au.high[k])
         frame = _blend(img1, img2, a)
         for _ in range(int((30 + 300 * kick) * env * amp)):
             x, y = random.randint(0, w - 1), random.randint(0, h - 1)
@@ -252,7 +261,7 @@ def wave_distort_effect(img1, img2, num_frames, intensity, easing, alphas=None, 
     x1d = np.arange(w, dtype=np.float32)[None, :]
     p1 = p2 = 0.0
     for k, a in enumerate(al):
-        env, kick, bass, mid, high = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.mid[k]), float(au.high[k])
+        env, kick, bass, mid, high = _gain(a, au, k), float(au.kick[k]), float(au.bass[k]), float(au.mid[k]), float(au.high[k])
         p1 += 0.10 + 0.5 * high
         p2 += 0.07 + 0.4 * mid
         A = intensity * (0.6 + 2.2 * bass + 1.5 * kick) * env
@@ -272,7 +281,7 @@ def zoom_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=No
     center = (w / 2.0, h / 2.0)
     taps = 7
     for k, a in enumerate(al):
-        env, kick, mid = _env(a), float(au.kick[k]), float(au.mid[k])
+        env, kick, mid = _gain(a, au, k), float(au.kick[k]), float(au.mid[k])
         frame = _blend(img1, img2, a)
         z = (intensity / 50.0) * env * (0.25 + 1.2 * kick)
         ang = (mid - 0.5) * env * (intensity / 10.0)
@@ -370,7 +379,7 @@ def color_echo_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
     au = _au(audio, len(al))
     hist = []
     for k, a in enumerate(al):
-        env, kick = _env(a), float(au.kick[k])
+        env, kick = _gain(a, au, k), float(au.kick[k])
         hist = (hist + [_blend(img1, img2, a)])[-18:]
         maxd = min(len(hist) - 1, int(3 + intensity / 4))
         dR = int(round(float(au.bass[k]) * maxd * env))
@@ -396,11 +405,11 @@ def particle_float_effect(img1, img2, num_frames, intensity, easing, alphas=None
     pos, vel = np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
     ttl, col = np.zeros(0, np.int32), np.zeros((0, 3), np.uint8)
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, rms, bass, mid = float(au.kick[k]), float(au.rms[k]), float(au.bass[k]), float(au.mid[k])
         frame = _blend(img1, img2, a)
         remaining = len(al) - k - 1
-        if remaining > 2 and ((kick > 0.5 and prev <= 0.5) or random.random() < 0.15 * rms * env):
+        if remaining > 2 and ((kick > 0.4 and prev <= 0.4) or random.random() < 0.15 * rms * env):
             nb = max(4, int((40 + 240 * kick) * min(1.5, intensity / 15.0) * max(env, 0.25)))
             c = np.array([random.uniform(0.1 * w, 0.9 * w), random.uniform(0.1 * h, 0.9 * h)], np.float32)
             p = c + np.random.normal(0, 18, (nb, 2)).astype(np.float32)
@@ -437,7 +446,7 @@ def film_look_effect(img1, img2, num_frames, intensity, easing, alphas=None, aud
     r2 = (((xs - w / 2.0) / (w / 2.0)) ** 2 + ((ys - h / 2.0) / (h / 2.0)) ** 2) / 2.0
     prev = 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass, high, rms, hit = (float(au.kick[k]), float(au.bass[k]), float(au.high[k]),
                                       float(au.rms[k]), float(au.onset[k]))
         frame = _blend(img1, img2, a)
@@ -474,9 +483,9 @@ def vhs_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=Non
     roll_pos = roll_vel = phase = prev = 0.0
     amp = intensity / 15.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass, high, rms = float(au.kick[k]), float(au.bass[k]), float(au.high[k]), float(au.rms[k])
-        if kick > 0.55 and prev <= 0.55:
+        if kick > 0.4 and prev <= 0.4:
             roll_vel += random.choice((-1, 1)) * h * 0.04 * kick
         prev = kick
         roll_pos = (roll_pos + roll_vel) * 0.8
@@ -515,7 +524,7 @@ def motion_blur_effect(img1, img2, num_frames, intensity, easing, alphas=None, a
     kq = max(3, int(qw * 0.4)) | 1
     angle, taps = 0.0, 9
     for k, a in enumerate(al):
-        env, kick, mid, rms = _env(a), float(au.kick[k]), float(au.mid[k]), float(au.rms[k])
+        env, kick, mid, rms = _gain(a, au, k), float(au.kick[k]), float(au.mid[k]), float(au.rms[k])
         frame = _blend(img1, img2, a)
         angle += 0.05 + 0.3 * mid
         L = (0.01 + 0.10 * kick + 0.04 * rms) * w * env * (intensity / 15.0)
@@ -551,8 +560,8 @@ def scanlines_effect(img1, img2, num_frames, intensity, easing, alphas=None, aud
     roll, prev = 0.0, 0.0
     amp = min(1.0, intensity / 20.0)
     for k, a in enumerate(al):
-        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
-        if kick > 0.55 and prev <= 0.55:
+        env, kick, bass, rms = _gain(a, au, k), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
+        if kick > 0.4 and prev <= 0.4:
             roll += random.uniform(1, 3)
         prev = kick
         kb = (0.04 + 0.28 * kick + 0.10 * bass) * (env ** 1.5) * amp * 1.5
@@ -579,9 +588,9 @@ def burn_in_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio
     center = (w / 2.0, h / 2.0)
     P, prev = None, 0.0
     for k, a in enumerate(al):
-        env, kick, bass, rms = _env(a), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
+        env, kick, bass, rms = _gain(a, au, k), float(au.kick[k]), float(au.bass[k]), float(au.rms[k])
         cur = _blend(img1, img2, a).astype(np.float32)
-        if P is None or (kick > 0.55 and prev <= 0.55):
+        if P is None or (kick > 0.4 and prev <= 0.4):
             P = cur.copy()
         prev = kick
         M = cv2.getRotationMatrix2D(center, 0, 1.0 + 0.012 + 0.03 * rms)
@@ -607,7 +616,7 @@ def light_leaks_effect(img1, img2, num_frames, intensity, easing, alphas=None, a
     fx, fy = 0.5, 0.5
     for k, a in enumerate(al):
         env, kick, rms, bass, high = _env(a), float(au.kick[k]), float(au.rms[k]), float(au.bass[k]), float(au.high[k])
-        if kick > 0.55 and prev <= 0.55:
+        if kick > 0.4 and prev <= 0.4:
             flare, fx, fy = 1.0, random.uniform(0.15, 0.85), random.uniform(0.15, 0.85)
         prev = kick
         frame = _blend(img1, img2, a)
@@ -622,7 +631,7 @@ def light_leaks_effect(img1, img2, num_frames, intensity, easing, alphas=None, a
         if flare > 0.05:
             fl = np.exp(-(((gx - fx) / 0.35) ** 2 + ((gy - fy) / 0.035) ** 2) / 2.0) + \
                  np.exp(-(((gx - fx) ** 2 + (gy - fy) ** 2) / (2 * 0.06 ** 2)))
-            layer += fl[:, :, None] * np.array([255, 235, 170], np.float32) * (0.7 * flare * env)
+            layer += fl[:, :, None] * np.array([255, 235, 170], np.float32) * (0.7 * flare * _gain(a, au, k))
             flare *= 0.7
         leak = cv2.resize(np.clip(layer, 0, 255), (w, h), interpolation=cv2.INTER_LINEAR)
         yield np.clip(255.0 - (255.0 - frame.astype(np.float32)) * (255.0 - leak) / 255.0, 0, 255).astype(np.uint8)
@@ -687,7 +696,7 @@ def kick_zoom_effect(img1, img2, num_frames, intensity, easing, alphas=None, aud
     amp = intensity / 50.0
     cx, cy, direction, prev_kick = w / 2.0, h / 2.0, 1, 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass = float(au.kick[k]), float(au.bass[k])
         if kick > 0.55 and prev_kick <= 0.55:
             cx, cy = random.randint(w // 4, 3 * w // 4), random.randint(h // 4, 3 * h // 4)
@@ -717,7 +726,7 @@ def flow_smear_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
     cur = img1.copy()
     amp = intensity / 15.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         g = (0.05 + 0.30 * float(au.onset[k]) + 0.12 * float(au.rms[k])) * amp * (env ** 0.5)
         g = min(g, 0.7)
         cur = cv2.remap(cur, xs - g * flow[..., 0], ys - g * flow[..., 1],
@@ -737,7 +746,7 @@ def block_shuffle_effect(img1, img2, num_frames, intensity, easing, alphas=None,
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     up = lambda m: np.repeat(np.repeat(m, bs, axis=0), bs, axis=1)[:h, :w]
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass, rms = float(au.onset[k]), float(au.bass[k]), float(au.rms[k])
         base = np.where(up(a > tau)[:, :, None], img2, img1)
         p = float(np.clip(0.03 + 0.85 * kick + 0.25 * rms, 0, 1)) * env
@@ -783,7 +792,7 @@ def feedback_tunnel_effect(img1, img2, num_frames, intensity, easing, alphas=Non
     amp = intensity / 15.0
     prev = None
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         rms, bass, high, kick = float(au.rms[k]), float(au.bass[k]), float(au.high[k]), float(au.kick[k])
         cur = _blend(img1, img2, a)
         if prev is None:
@@ -813,9 +822,9 @@ def pixel_sort_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
     amp = min(1.0, intensity / 20.0 + 0.3)
     vertical, prev = False, 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass = float(au.kick[k]), float(au.bass[k])
-        if kick > 0.55 and prev <= 0.55:
+        if kick > 0.4 and prev <= 0.4:
             vertical = not vertical
         prev = kick
         frame = _blend(img1, img2, a)
@@ -841,12 +850,12 @@ def shockwave_effect(img1, img2, num_frames, intensity, easing, alphas=None, aud
     au = _au(audio, len(al))
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     size = float(max(h, w))
-    speed, width = 0.04 * size, 0.09 * size
+    speed, width = 0.05 * size, 0.11 * size
     rings, prev = [], 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick = float(au.kick[k])
-        if kick > 0.5 and prev <= 0.5:
+        if kick > 0.4 and prev <= 0.4:
             cx, cy = random.uniform(0.25 * w, 0.75 * w), random.uniform(0.25 * h, 0.75 * h)
             dx, dy = xs - cx, ys - cy
             dist = np.sqrt(dx * dx + dy * dy) + 1e-3
@@ -858,7 +867,7 @@ def shockwave_effect(img1, img2, num_frames, intensity, easing, alphas=None, aud
             r["age"] += 1
             u = (r["dist"] - r["age"] * speed) / width
             prof = np.exp(-u * u) * np.sin(u * 3.0)
-            amp_px = float(r["amp"] * intensity * 3.4 * np.exp(-r["age"] * 0.10) * env)
+            amp_px = float(r["amp"] * intensity * 5.0 * np.exp(-r["age"] * 0.10) * env)
             ox += amp_px * prof * r["dx"]
             oy += amp_px * prof * r["dy"]
         rings = [r for r in rings if r["age"] < 40]
@@ -878,9 +887,9 @@ def kaleido_pulse_effect(img1, img2, num_frames, intensity, easing, alphas=None,
     r, th = np.sqrt(dx * dx + dy * dy), np.arctan2(dy, dx)
     n_seg, rot, prev = 6, 0.0, 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick = float(au.kick[k])
-        if kick > 0.55 and prev <= 0.55:
+        if kick > 0.4 and prev <= 0.4:
             n_seg = random.choice((3, 4, 5, 6, 8, 10))
         prev = kick
         rot += 0.01 + 0.08 * float(au.mid[k])
@@ -891,7 +900,7 @@ def kaleido_pulse_effect(img1, img2, num_frames, intensity, easing, alphas=None,
         kal = cv2.remap(frame, (cx + rs * np.cos(th_f)).astype(np.float32),
                         (cy + rs * np.sin(th_f)).astype(np.float32),
                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        m = float(np.clip(env ** 0.7 * (0.55 + 0.45 * kick), 0, 1))
+        m = float(np.clip(env ** 0.7 * (0.15 + 0.85 * kick), 0, 1))
         yield cv2.addWeighted(frame, 1 - m, kal, m, 0)
 
 def time_slice_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio=None):
@@ -905,7 +914,7 @@ def time_slice_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
     bounds = [(b * h // nb, (b + 1) * h // nb) for b in range(nb)]
     hist = []
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         hist = (hist + [_blend(img1, img2, a)])[-14:]
         maxd = min(len(hist) - 1, int(2 + intensity / 4))
         delays = np.round(np.clip(au.bands[k][::-1] * 1.2, 0, 1) * maxd * env).astype(int)
@@ -939,7 +948,7 @@ def shatter_effect(img1, img2, num_frames, intensity, easing, alphas=None, audio
     xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     energy = 0.0
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, bass, high = float(au.kick[k]), float(au.bass[k]), float(au.high[k])
         energy = max(energy * 0.8, kick)
         base = np.where((a > tau)[label][:, :, None], img2, img1)
@@ -969,7 +978,7 @@ def luma_crush_effect(img1, img2, num_frames, intensity, easing, alphas=None, au
     perms = [(2, 0, 1), (1, 2, 0), (2, 1, 0), (0, 2, 1)]
     perm, prev, ws = None, 0.0, 0.2
     for k, a in enumerate(al):
-        env = _env(a)
+        env = _gain(a, au, k)
         kick, high = float(au.kick[k]), float(au.high[k])
         m = np.clip((a - key * (1 - ws)) / ws, 0, 1)[:, :, None]
         frame = f1 * (1 - m) + f2 * m
@@ -1171,8 +1180,14 @@ def adjust_beat_grid(beat_times, mode):
 
 def beat_frame_counts(beat_times, fps, min_frames=4):
     """Frame per transizione dai tempi ASSOLUTI dei beat (round sui confini cumulativi):
-    l'errore non si accumula, a differenza di round() su ogni intervallo."""
+    l'errore non si accumula, a differenza di round() su ogni intervallo.
+    I confini interni anticipano il beat di ~3 frame (meno su griglie veloci): il colpo cade così a
+    qualche frame dall'inizio della transizione, non sul confine dove un ±1 frame di scarto del beat
+    tracker lo farebbe finire a cavallo tra due transizioni. La somma dei frame non cambia."""
     edges = np.round(np.asarray(beat_times, dtype=np.float64) * fps).astype(int)
+    if len(edges) > 2:
+        lead = int(min(3, max(0.0, float(np.median(np.diff(edges))) * 0.25)))
+        edges[1:-1] -= lead
     kept = [int(edges[0])]
     for e in edges[1:]:
         if e - kept[-1] >= min_frames:
